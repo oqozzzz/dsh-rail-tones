@@ -1,0 +1,5 @@
+# dsh-rail-tones 的挂载声明：向 profile 的配置树插入一行，
+# 宿主半边只负责让这一行存在，音效全部由浏览器半边（client.js）实现。
+- insert:
+    - id: dsh-rail-tones
+      name: dsh-rail-tones

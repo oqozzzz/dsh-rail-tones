@@ -1,0 +1,16 @@
+# 依赖与打包产物
+node_modules/
+*.tgz
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+*.log
+*.tmp
+
+# 本机专用的内部交接文档：含本机绝对路径、profile 细节与实盘日志，不随仓库发布
+HANDOFF.md

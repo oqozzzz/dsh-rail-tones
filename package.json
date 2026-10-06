@@ -1,0 +1,31 @@
+{
+  "name": "dsh-rail-tones",
+  "version": "0.1.12",
+  "private": true,
+  "type": "module",
+  "description": "会话导航条音效：光标划过 / 拖动 / 点击刻度 / 滚轮翻阅官方 Turn Rail 时，按会话位置播放五声音阶提示音。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "license": "MIT"
+}
