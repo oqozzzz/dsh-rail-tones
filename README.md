@@ -136,7 +136,7 @@ __dshRailTones.setVolume(0.3)
 | 关注点 | 做法 |
 |---|---|
 | 刻度识别 | `nav` 内含 `button[data-index]`（官方 TurnMark），不依赖任何哈希 CSS 类名 |
-| 槽位服务时序 | 客户端这一行在组合脚本里排在前面，`apply` 执行时 **`ctx.slots` 可能是 `undefined`**（模块级 `inject: ['slots']` 在客户端这条路径上不保证等到服务就绪）；`ctx.get('locale')` 未就绪时返回的也是 **undefined 而不是 null**，所有服务判定必须同时挡住两者（v0.1.9 只判 `!== null`，2026-10-06 实盘炸过一次）。因此用 `ctx.inject(['slots'], cb)` 作用域注入等服务就绪，且**任何失败（`slots === false` 或整条抛错）都按 400ms × 最多 60 次有界重试**，放弃时报 `settings-gave-up` |
+| 槽位服务时序 | 客户端这一行在组合脚本里排在前面，`apply` 执行时 **`ctx.slots` 可能是 `undefined`**（模块级 `inject: ['slots']` 在客户端这条路径上不保证等到服务就绪）；`ctx.get('locale')` 未就绪时返回的也是 **undefined 而不是 null**，所有服务判定必须同时挡住两者（v0.1.9 只判 `!== null`，2026-10-06 在真实会话中炸过一次）。因此用 `ctx.inject(['slots'], cb)` 作用域注入等服务就绪，且**任何失败（`slots === false` 或整条抛错）都按 400ms × 最多 60 次有界重试**，放弃时报 `settings-gave-up` |
 | 导轨唯一性 | 只认**直接拥有刻度**的 nav（`tick.closest('nav') === nav`）：外壳恰好也是 `<nav>` 时不会把它当成第二条导轨，避免整块面板乱发声 |
 | 刻度吸附 | 所有触发都先 `tickAt(nav, y)` 取指针所在/最近的刻度，用**刻度中线**换算位置 → 同一刻度上四种手势得到同一个音；另加 4px **滞回**：另一个刻度明显更近才切换，分界线抖动不跳档 |
 | 触发方式 | `pointermove`：光标划过（hover，**不需要按键**）与按住拖动都发声；`pointerdown`：点击发声；`click.detail === 0`：键盘激活发声；`wheel`：滚动停止 90ms 后取离指针最近的刻度 |

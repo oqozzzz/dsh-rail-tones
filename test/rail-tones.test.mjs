@@ -232,7 +232,7 @@ async function bootPlugin(options) {
   };
   ctx.inject = (deps, callback) => callback(ctx);
 
-  // breakSlots：让 slots 的读取抛错，模拟「注册链整体炸掉」（B4 的形态）。
+  // breakSlots：让 slots 的读取抛错，模拟「注册链整体炸掉」（slot 服务未就绪时的抛错形态）。
   let broken = config.breakSlots === true;
   if (broken) {
     const realSlots = ctx.slots;
@@ -674,7 +674,7 @@ test('接线：同一刻度上抖动只响一声（监听层音级闸门真的�
   assert.equal(boot.debug().status().notesPlayed, 1);
   // 越过控制器的 250ms 同音级窗口：此后还拦得住的只有监听层的音级闸门。
   // 回归：适配器曾经吞掉 controller.signal 的返回值，监听层锚点永远不更新，
-  // 于是每过 250ms 抖动一下就重响一声（2026-10-06 实盘日志的原样）。
+  // 于是每过 250ms 抖动一下就重响一声（2026-10-06 真实会话日志的原样）。
   t.mock.timers.tick(300);
   boot.rail.dispatch('pointermove', { target: tick, clientY: 25 });
   t.mock.timers.tick(300);

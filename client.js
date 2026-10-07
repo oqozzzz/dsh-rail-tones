@@ -528,7 +528,7 @@ window.__ModuleLoader__.load({
       let skippedByDegree = 0;
       let lastSkip = null;
       let acceptedCount = 0;
-      let resets = 0; // 锚点被真正清空的次数（B3 排查的关键指标：抖动时应为 0）
+      let resets = 0; // 锚点被真正清空的次数（重复发声排查的关键指标：抖动时应为 0）
       let lastReset = null;
       let offRailTimer = null; // 延迟确认「离开导轨」的定时器
       let wheelTimer = null;
@@ -550,7 +550,7 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * 「离开导轨」一律延迟确认（B3-d 的修复）：
+       * 「离开导轨」一律延迟确认：
        * 悬停刻度会触发宿主重渲染（markPreview 加宽、虚拟滚动回收节点），
        * 此间 pointermove 的 target 会短暂落到已分离节点 / 预览气泡上；
        * 若立刻清锚点，下一次微小移动就会被当成「离开后重新进入」而重放同一音。
@@ -612,7 +612,7 @@ window.__ModuleLoader__.load({
         // 音符由「指针所在刻度」决定：先吸附到刻度中线再换算位置，
         // 于是同一刻度上划过 / 按住滑动 / 点击 / 滚轮都得到同一个音。
         let tick = tickAt(nav, y);
-        // 滞回吸附（B3-d）：相邻刻度只有「明显更近」才切换，分界线上的抖动不再跳档。
+        // 滞回吸附：相邻刻度只有「明显更近」才切换，分界线上的抖动不再跳档。
         // 明确手势（点击 / 键盘）不滞回，保证点到哪个就是哪个。
         if (force !== true && tick !== null && anchoredTickIndex !== null && Number.isFinite(y)) {
           const anchored = resolveTickByIndex(nav, anchoredTickIndex);
@@ -665,7 +665,7 @@ window.__ModuleLoader__.load({
         const nav = hit(event.target);
         if (nav === null) {
           // 不再立刻清锚点：重渲染 / 预览气泡会让 target 短暂落到导轨之外，
-          // 立刻清锚点会把「同一刻度轻微移动」误判成「离开后再进入」而重复发声（B3-d）。
+          // 立刻清锚点会把「同一刻度轻微移动」误判成「离开后再进入」而重复发声。
           scheduleOffRailReset('move-off-rail');
           return;
         }
@@ -680,7 +680,7 @@ window.__ModuleLoader__.load({
 
       function onPointerOut(event) {
         // 指针离开这条导轨：同样走延迟确认（蹭到悬停预览气泡时 relatedTarget 也在
-        // nav 之外，立刻清锚点会造成与 B3-d 相同的重放）。
+        // nav 之外，立刻清锚点会造成同样的重放）。
         // relatedTarget 为 null 通常是宿主重渲染顶掉了节点，更不能当作「离开」。
         const nav = railNavFrom(event.target);
         if (nav === null) return;
@@ -1203,7 +1203,7 @@ window.__ModuleLoader__.load({
             view,
             arm: () => engine.arm(),
             // 必须把控制器的返回值交回去：emit 靠它更新监听层的音级锚点，
-            // 吞掉返回值会让「同音级不重响」的闸门形同虚设（v0.1.10 实盘复现）。
+            // 吞掉返回值会让「同音级不重响」的闸门形同虚设（v0.1.10 在真实会话中复现过）。
             signal: (position, source, tick, options) =>
               controller.signal(position, source, tick, options),
           });
