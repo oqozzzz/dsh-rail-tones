@@ -546,6 +546,25 @@ function fakeAudio() {
   return { context, nodes };
 }
 
+test('音频引擎：上下文 suspended 时丢弃调度而非堆叠在冻结的 currentTime 上', async () => {
+  const { createEngine } = (await loaded).internals;
+  const { context, nodes } = fakeAudio();
+  context.state = 'suspended';
+  const engine = createEngine({
+    AudioContext: function Fake() { return context; },
+    volume: () => 1,
+    voice: () => 'sine',
+  });
+  // 回归：suspended 时 currentTime 冻结，旧代码照常调度 → 整段时间窗的音符
+  // 堆在同一时间戳，resume 瞬间齐鸣。现在必须丢弃（不建任何节点）并返回 false。
+  assert.equal(engine.play(440), false, 'suspended 时 play 必须返回 false');
+  assert.equal(nodes.oscillators.length, 0, 'suspended 时不得创建振荡器');
+  // resume 后恢复正常发声。
+  context.state = 'running';
+  assert.equal(engine.play(440), true);
+  assert.equal(nodes.oscillators.length, 1);
+});
+
 test('音频引擎：正弦单振荡器，钢琴六分音、频率失谐且满幅不削波', async () => {
   const { createEngine, VOICES, PEAK_FACTOR, PIANO_PEAK_SCALE, PIANO_INHARM, PIANO_WEIGHTS, PIANO_WEIGHT_SUM } =
     (await loaded).internals;
@@ -672,7 +691,7 @@ test('音频引擎：未知音色 id 兜底默认合成器，绝不抛错', asyn
   assert.equal(DEFAULTS.voice, 'sine');
 });
 
-test('清单契约：package.json、patch 与客户端产物', () => {
+test('清单契约：package.json、patch 与客户端产物', async () => {
   const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   assert.equal(manifest.name, 'dsh-rail-tones');
   assert.equal(manifest.type, 'module');
@@ -708,6 +727,22 @@ test('清单契约：package.json、patch 与客户端产物', () => {
   const version = source.match(/const VERSION = '([^']+)'/);
   assert.ok(version !== null, 'client.js 必须声明 VERSION');
   assert.equal(version[1], manifest.version);
+
+  // 派生断言：音效注册表每个 id 必须挂上对应合成器，否则 play() 会静默走兜底，
+  // 新音效「注册表加了、引擎忘了」这种漂移立即在此显形。
+  const { VOICE_OPTIONS, DEFAULTS } = (await loaded).internals;
+  const synthMatch = source.match(/const SYNTHESIZERS = \{([^}]*)\}/);
+  assert.ok(synthMatch !== null, 'client.js 必须声明 SYNTHESIZERS 注册表');
+  for (const option of VOICE_OPTIONS) {
+    assert.ok(
+      new RegExp(`\\b${option.id}\\s*:`).test(synthMatch[1]),
+      `VOICE_OPTIONS 的 "${option.id}" 必须在 SYNTHESIZERS 有对应合成器`,
+    );
+  }
+  assert.ok(
+    new RegExp(`\\b${DEFAULTS.voice}\\s*:`).test(synthMatch[1]),
+    `默认音色 "${DEFAULTS.voice}" 必须在 SYNTHESIZERS 有对应合成器`,
+  );
 });
 
 test('设置注册：locale 服务未就绪（undefined）不打断注册链', async () => {

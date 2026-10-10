@@ -19,7 +19,7 @@
 window.__ModuleLoader__.load({
   id: 'dsh-rail-tones',
   factory(require) {
-    const VERSION = '0.2.2';
+    const VERSION = '0.2.3';
 
     /* ------------------------------------------------------------------ *
      * 常量                                                                *
@@ -381,6 +381,10 @@ window.__ModuleLoader__.load({
         }
         const audio = ensure();
         if (audio === null) return false;
+        // suspended 时 currentTime 冻结：照常调度会把整段时间窗的音符堆在同一
+        // 时间戳上，resume 瞬间齐鸣。宁可不响，也不能堆叠（滚轮不算用户激活
+        // 手势、不预热上下文，纯滚轮用户第一声必踩这个坑）。
+        if (audio.state !== 'running') return false;
         const bounded = Math.min(MAX_VOLUME, Math.max(0, volume));
         // 分发查注册表：未知 id（如未接上合成器的新音效）兜底默认合成器，绝不抛错。
         const synth = SYNTHESIZERS[voice] === undefined ? SYNTHESIZERS[DEFAULTS.voice] : SYNTHESIZERS[voice];
@@ -908,6 +912,9 @@ window.__ModuleLoader__.load({
       }
 
       function onWheel(event) {
+        // 滚轮不被计为用户激活手势，arm() 不预热的上下文会一直卡在
+        // suspended（play() 会丢弃），所以这里也要补一次 resume 尝试。
+        env.arm();
         const nav = hit(event.target);
         if (nav === null) return;
         const y = event.clientY;
@@ -1469,19 +1476,27 @@ window.__ModuleLoader__.load({
           voice: () => state.get().voice,
         });
         let lastTick = null;
+        let mutedCount = 0;
         const recent = [];
         const controller = createController({
           play: (hz, meta) => {
             lastTick = meta !== null && meta !== undefined && meta.tick !== null ? meta.tick : null;
+            let played = false;
+            try {
+              played = engine.play(hz);
+            } catch (error) {
+              played = false;
+            }
+            if (played !== true) mutedCount += 1;
             recent.push({
               at: Date.now(),
               hz: Math.round(hz * 100) / 100,
               source: meta === null || meta === undefined ? null : meta.source,
               tick: lastTick,
               degree: meta === null || meta === undefined ? null : meta.degree,
+              played: played === true,
             });
             if (recent.length > 20) recent.shift();
-            engine.play(hz);
           },
           now: () => Date.now(),
           isEnabled: () => state.get().enabled,
@@ -1616,6 +1631,7 @@ window.__ModuleLoader__.load({
         //    —— 服务就绪是竞态，一次失败就放弃等于把卡片永久丢掉。
         let settingsTimer = null;
         let settingsTries = 0;
+        let settingsRegistered = false;
         const stopSettingsRetry = () => {
           if (settingsTimer !== null) clearTimeout(settingsTimer);
           settingsTimer = null;
@@ -1629,6 +1645,10 @@ window.__ModuleLoader__.load({
         };
 
         const startSettings = (scoped) => {
+          // ctx.inject(['slots'], …) 在服务重复就绪时会再次触发；已成功注册的
+          // id 再 register 必抛错，会把真注册好的卡片误报成 settings-failed。
+          // 只挡成功路径：失败/未尝试时二次进入反而是恢复途径，不能挡。
+          if (settingsRegistered) return;
           const target = scoped === undefined || scoped === null ? ctx : scoped;
           settingsTries += 1;
           const exhausted = settingsTries >= SETTINGS_MAX_TRIES;
@@ -1649,6 +1669,9 @@ window.__ModuleLoader__.load({
             if (settingsTries === 1) report('settings-threw');
             scheduleSettingsRetry();
             return;
+          }
+          if (settings !== null && settings !== undefined && settings.registered === true) {
+            settingsRegistered = true;
           }
           if (settings !== null && settings !== undefined && settings.slots === false) {
             if (exhausted) report('settings-gave-up');
@@ -1678,6 +1701,7 @@ window.__ModuleLoader__.load({
               version: VERSION,
               instances: instances.count,
               notesPlayed: controller.stats().notesPlayed,
+              mutedCount,
               lastNoteHz: controller.stats().lastHz,
               lastTick,
               railSeen: runtime.listeners === null ? false : runtime.listeners.railSeen(),

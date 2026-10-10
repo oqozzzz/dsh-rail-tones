@@ -7,7 +7,7 @@
 - **零素材、零依赖、零宿主服务**：Web Audio 实时合成；不 require 任何 `@deepseek-ai/*` 客户端包；宿主半边为空。
 - **只读观察**：只用 `document` 上的捕获阶段 + `passive` 委托监听，不写 DOM、不 `preventDefault`、不 `stopPropagation`，官方跳转 / 悬停预览 / 键盘聚焦行为完全不变。
 
-当前版本 **v0.2.1**；版本历史见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本 **v0.2.3**；版本历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 安装
 
@@ -107,12 +107,12 @@ Get-Content "$env:USERPROFILE\.dsh\rail-tones-report.json" -Raw
 
 ```js
 __dshRailTones.status()
-// { version, instances, enabled, volume, voice, notesPlayed, lastNoteHz, lastTick,
+// { version, instances, enabled, volume, voice, notesPlayed, mutedCount, lastNoteHz, lastTick,
 //   railSeen, audioState,
 //   settings: { registered, attempts, error },
 //   dedup: { accepted, skippedByDegree, lastDegree, lastTickIndex,
 //            lastPosition, lastSkip, resets, lastReset, offRailPending, railKnown } }
-__dshRailTones.log(10)        // 最近 10 次真正发声：{ at, hz, source, tick, degree }
+__dshRailTones.log(10)        // 最近 10 次调度：{ at, hz, source, tick, degree, played }
 __dshRailTones.rails()        // 页面上每个「含刻度按钮的 nav」→ { used, ticks, width, height }
 __dshRailTones.play(0.5)      // 手动发一声（会话中段）
 __dshRailTones.setEnabled(false)
@@ -125,6 +125,9 @@ __dshRailTones.setVoice('piano')   // 注册表内任意 id（'sine' | 'piano' |
 - `version` / 设置卡片右下角的版本号 —— 不是最新版就说明新产物还没下发（重启 DSH Desktop）；
 - `instances` —— 正常为 `1`（挂载时会主动销毁上一份残留实例）；
 - `settings.registered` —— 设置卡片没出现时看这里：`false` + `error` 就是槽位注册失败的原因；
+- `mutedCount` / `log()` 里的 `played: false` —— 「没声音」先看这里：调度被音频层丢弃
+  （音量为 0、上下文不可用或还卡在 `suspended`）。`mutedCount` 持续增长而扬声器无声
+  → 查 `audioState` 是否为 `suspended`（做一次点击/按键手势即可唤醒）；
 - `dedup` —— 抖动时 `skippedByDegree` 应持续增长而 `notesPlayed` 不动；`resets` 应保持为 0
   （>0 说明去重锚点被清过，`lastReset.reason` 指明是哪条路径清的）。
 
@@ -151,8 +154,8 @@ __dshRailTones.setVoice('piano')   // 注册表内任意 id（'sine' | 'piano' |
 | 明确手势 | `pointerdown`（按下）与键盘激活（`click.detail === 0`）带 `repeat`：即使与上一声同音级也再响一次作为确认，仍受 70ms 最小间隔约束（v0.1.10 起 `repeat` 才真的透传到调度器；此前在 `apply` 的适配器里被丢掉，250ms 内的点击是静音的） |
 | 槽位注册 | `slots.register()` 在槽位**尚未被父级声明**时会抛错（`slot "…" is not declared`）。启动早于设置页时不能一次注册就放弃：内层按 400ms 有界重试（inject 45 次、register 12 次），成功即停，owner 折叠时清定时器；结果记在 `status().settings`。**`status.error` 只在注册成功时清空** —— 失败原文若被后续步骤覆盖，自报里就只剩 `registered:false`，无从定位（v0.1.9 踩过） |
 | 单实例 | 市场禁用/启用走**热挂载**（不刷新页面）。挂载前先 `dispose()` 掉 `window.__dshRailTonesActive` 上残留的上一个实例，避免同一指针动作被多份监听各响一遍 |
-| 自证 | `status()` 暴露 `version / instances / settings{registered,attempts,error,retriesLeft} / dedup{…}`；`log()` 返回最近 20 次发声明细；设置卡片右下角显示版本号；宿主半边提供 `GET /rail-tones/status` + `POST /rail-tones/report`（并镜像到 `~/.dsh/rail-tones-report.json`），让「启动时到底有没有挂载」在终端可读 |
-| 自动播放策略 | 首次 `pointerdown`/`keydown` 预热 `AudioContext`；`state !== 'running'` 时尝试 `resume()`，失败即静默 |
+| 自证 | `status()` 暴露 `version / instances / settings{registered,attempts,error,retriesLeft} / mutedCount / dedup{…}`；`log()` 返回最近 20 次调度明细（含 `played` 生效标记）；设置卡片右下角显示版本号；宿主半边提供 `GET /rail-tones/status` + `POST /rail-tones/report`（并镜像到 `~/.dsh/rail-tones-report.json`），让「启动时到底有没有挂载」在终端可读 |
+| 自动播放策略 | 首次 `pointerdown`/`keydown` 预热 `AudioContext`；`state !== 'running'` 时尝试 `resume()`（滚轮事件也会补试一次），仍非 running 则**丢弃该次调度**（`played: false` + `mutedCount` +1）而非堆叠在冻结的 `currentTime` 上 —— 否则上下文恢复瞬间整段时间窗的音符会齐鸣（v0.2.3 修） |
 | 生命周期 | 监听器、定时器、音频上下文全部在 `ctx.effect` 内注册并在卸载时清理 |
 | 失败模式 | 任何异常只 `console.warn` 一次；导轨结构变化时软降级为无声，不影响宿主 |
 
@@ -195,8 +198,8 @@ __dshRailTones.setVoice('piano')   // 注册表内任意 id（'sine' | 'piano' |
 
 - 开发与验证环境为 DSH Desktop `0.2.0-rc.2`（Electron 44 / Chromium 152）；其它宿主版本不保证。
 - 会话真实提问少于 2 轮时官方不渲染导轨，此时不会有任何声音（设计如此）。
-- 滚轮发声在音频上下文尚未被用户手势激活时会静默跳过（浏览器自动播放策略）。
-- 音色为合成正弦；如需更换音色，只改 `client.js` 里的音色参数即可。
+- 滚轮发声在音频上下文尚未被用户手势激活时会静默跳过（浏览器自动播放策略；滚轮事件本身会尝试唤醒上下文，唤醒后正常）。
+- 音色有正弦音 / 钢琴 / 清音三种，设置页可切换；如需新增音色，按 `client.js` 里 `VOICE_OPTIONS` 注册表上方的注释三步走即可。
 - 与官方导轨的耦合点是「`nav` + `button[data-index]` + 可滚动祖先」这三个语义特征；DSH 未来大改版会让插件无声降级（不报错）。
 
 ## 许可
