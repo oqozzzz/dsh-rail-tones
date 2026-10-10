@@ -19,7 +19,7 @@
 window.__ModuleLoader__.load({
   id: 'dsh-rail-tones',
   factory(require) {
-    const VERSION = '0.2.1';
+    const VERSION = '0.2.2';
 
     /* ------------------------------------------------------------------ *
      * 常量                                                                *
@@ -43,6 +43,7 @@ window.__ModuleLoader__.load({
     const VOICE_OPTIONS = Object.freeze([
       Object.freeze({ id: 'sine', labelKey: 'voiceSine', descKey: 'voiceSineDesc' }),
       Object.freeze({ id: 'piano', labelKey: 'voicePiano', descKey: 'voicePianoDesc' }),
+      Object.freeze({ id: 'chime', labelKey: 'voiceChime', descKey: 'voiceChimeDesc' }),
     ]);
     const VOICES = Object.freeze(
       VOICE_OPTIONS.reduce((acc, option) => {
@@ -65,6 +66,21 @@ window.__ModuleLoader__.load({
     const PIANO_INHARM = 0.0002; // 失谐系数：f_n = 基频 × n × (1 + 系数 × n²)，钢琴质感的关键
     const PIANO_DECAY_S = 0.45; // master 指数衰减时长（比正弦音长，琴声余韵）
     const PIANO_PEAK_SCALE = 0.8; // 满音量峰值 = PEAK_FACTOR × 0.8 ≈ 0.70，留头部空间
+    // 清音音色（v0.2.2）：基频为主 + 钟类无谐分音 + 「前置引导音」的软钟音，
+    // 参数按实测比对报告逆向设计。mimo 桌面端 E4 事件精细跟踪实测：
+    //   - 快速下行琶音：~586→523→390→327→260Hz，每级约 40ms，主音（末级）余韵最长；
+    //   - 主音 t20 ≈ 215ms；主音段 1.19×/1.5× 处残留的其实是琶音前音（G4 等），非泛音；
+    //   - 起音软。
+    // 简化建模：主音（基频）+ 钟类无谐分音（1.5×，弱）营造钟质感 + 上方五度 40ms 引导音。
+    const CHIME_WEIGHTS = Object.freeze([1, 0.041]); // 主音分音幅度：0.041=10^(-27.7/20)
+    const CHIME_WEIGHT_SUM = CHIME_WEIGHTS.reduce((acc, value) => acc + value, 0); // Σ 归一 → 不削波
+    const CHIME_RATIOS = Object.freeze([1, 1.5]); // 分音频率比（1.5× = 纯五度上方倍频，钟类质感）
+    const CHIME_LEAD_RATIO = 1.5; // 引导音 = 主音 × 1.5（上方五度，实测琶音末两级 ≈ 390→260 即此关系）
+    const CHIME_LEAD_S = 0.04; // 引导音时长 ≈ 40ms（实测每级时长）
+    const CHIME_LEAD_LEVEL = 0.55; // 引导音峰值 ≈ 主音 -5dB（实测前级短音幅度约为主音一半）
+    const CHIME_ATTACK_S = 0.03; // 起音 30ms：比 sine/piano 软，去掉敲击感、保留响应灵敏
+    const CHIME_DECAY_S = 0.85; // 指数衰减到 0.0001（-80dB）→ -20dB 点 ≈ 0.21s，与实测余韵对齐
+    const CHIME_PEAK_SCALE = 0.9; // 满音量峰值 = PEAK_FACTOR × 0.9 ≈ 0.79，留头部空间
 
     const MESSAGES = {
       zh: {
@@ -79,6 +95,8 @@ window.__ModuleLoader__.load({
         voiceSineDesc: '清脆的单一正弦波，默认音色',
         voicePiano: '钢琴',
         voicePianoDesc: '多分音合成的钢琴质感',
+        voiceChime: '清音',
+        voiceChimeDesc: '基频为主、带高泛音的软钟提示音',
         preview: '试听',
         previewDesc: '试听会话中段对应的提示音（关闭开关后试听同样静音）。',
         previewButton: '试听',
@@ -95,6 +113,8 @@ window.__ModuleLoader__.load({
         voiceSineDesc: 'A clean single sine beep (default)',
         voicePiano: 'Piano',
         voicePianoDesc: 'Multi-partial synthesized piano',
+        voiceChime: 'Chime',
+        voiceChimeDesc: 'Soft bell tone with a bright high partial',
         preview: 'Preview',
         previewDesc: 'Plays the tone for the middle of the session (silent while the switch is off).',
         previewButton: 'Preview',
@@ -340,7 +360,7 @@ window.__ModuleLoader__.load({
        * 新音效（含未来的自定义音效）在这里挂上对应的 play* 实现即可，
        * 分发与 UI 都不需要再改。
        */
-      const SYNTHESIZERS = { sine: playSine, piano: playPiano };
+      const SYNTHESIZERS = { sine: playSine, piano: playPiano, chime: playChime };
 
       function play(hz) {
         if (typeof hz !== 'number' || !Number.isFinite(hz)) return false;
@@ -428,6 +448,65 @@ window.__ModuleLoader__.load({
           partials.push({ oscillator, gain });
         }
         // 任一分音结束即统一回收（同节流窗口内它们几乎同时收尾，逐个挂 onended 反而啰嗦）。
+        partials[0].oscillator.onended = () => {
+          for (const part of partials) {
+            try {
+              part.oscillator.disconnect();
+              part.gain.disconnect();
+            } catch (error) {
+              /* 已断开 */
+            }
+          }
+          try {
+            master.disconnect();
+          } catch (error) {
+            /* 已断开 */
+          }
+        };
+        return true;
+      }
+
+      /**
+       * 清音（v0.2.2）：主音 + 钟类无谐分音 + 上方五度 40ms 引导音的软钟音（贴近实测的 mimo 提示音）。
+       * 主音 2 个分音并联进 master gain（权重按 Σ 归一 → 不削波）；引导音独立 gain，
+       * 在主音起音前响 40ms（复刻实测的快速下行琶音）；master 指数衰减 -80dB（-20dB ≈ 0.21s）。
+       */
+      function playChime(audio, hz, volume) {
+        const start = audio.currentTime;
+        const peak = volume * PEAK_FACTOR * CHIME_PEAK_SCALE;
+        const master = audio.createGain();
+        master.gain.setValueAtTime(0.0001, start);
+        master.gain.linearRampToValueAtTime(peak, start + CHIME_ATTACK_S);
+        master.gain.exponentialRampToValueAtTime(0.0001, start + CHIME_DECAY_S);
+        master.connect(audio.destination);
+        const partials = [];
+        // 主音分音（基频 + 1.5× 钟类质感分音）。
+        for (let i = 0; i < CHIME_WEIGHTS.length; i += 1) {
+          const oscillator = audio.createOscillator();
+          const gain = audio.createGain();
+          oscillator.type = 'sine';
+          oscillator.frequency.setValueAtTime(hz * CHIME_RATIOS[i], start);
+          gain.gain.setValueAtTime(CHIME_WEIGHTS[i] / CHIME_WEIGHT_SUM, start);
+          oscillator.connect(gain);
+          gain.connect(master);
+          oscillator.start(start);
+          oscillator.stop(start + CHIME_DECAY_S + 0.02);
+          partials.push({ oscillator, gain });
+        }
+        // 引导音：主音起音前 40ms 短促上方五度（实测琶音的末两级关系），随主音 master 包络衰减。
+        const leadOsc = audio.createOscillator();
+        const leadGain = audio.createGain();
+        leadOsc.type = 'sine';
+        leadOsc.frequency.setValueAtTime(hz * CHIME_LEAD_RATIO, start);
+        leadGain.gain.setValueAtTime(0.0001, start);
+        leadGain.gain.linearRampToValueAtTime(CHIME_LEAD_LEVEL / (CHIME_LEAD_LEVEL + 1), start + CHIME_LEAD_S * 0.4);
+        leadGain.gain.exponentialRampToValueAtTime(0.0001, start + CHIME_LEAD_S);
+        leadOsc.connect(leadGain);
+        leadGain.connect(master);
+        leadOsc.start(start);
+        leadOsc.stop(start + CHIME_LEAD_S + 0.02);
+        partials.push({ oscillator: leadOsc, gain: leadGain });
+        // 任一分音结束即统一回收（与 playPiano 同一模式）。
         partials[0].oscillator.onended = () => {
           for (const part of partials) {
             try {
@@ -1707,6 +1786,16 @@ window.__ModuleLoader__.load({
         PIANO_INHARM,
         PIANO_DECAY_S,
         PIANO_PEAK_SCALE,
+        CHIME_WEIGHTS,
+        CHIME_WEIGHT_SUM,
+        CHIME_RATIOS,
+        CHIME_LEAD_RATIO,
+        CHIME_LEAD_S,
+        CHIME_LEAD_LEVEL,
+        CHIME_ATTACK_S,
+        CHIME_DECAY_S,
+        CHIME_PEAK_SCALE,
+        ATTACK_S,
         normalizeVoice,
         STORE_KEY,
         degreeForPosition,

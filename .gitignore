@@ -14,3 +14,7 @@ Thumbs.db
 
 # 本机专用的内部交接文档：含本机绝对路径、profile 细节与真实会话日志，不随仓库发布
 HANDOFF.md
+
+# 比对验证产物：报告与图表随仓库走，音频/中间数据不入库
+compare/*.wav
+compare/*.json

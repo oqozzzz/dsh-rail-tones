@@ -469,8 +469,9 @@ test('音色切换：默认正弦、白名单钳制、存量兼容与持久化',
   const { createState, STORE_KEY, DEFAULTS, VOICES, VOICE_OPTIONS, normalizeVoice } = (await loaded).internals;
 
   // 注册表：每项有 id/labelKey/descKey，id 唯一，默认 = 第一项；VOICES 由注册表派生。
-  assert.ok(Array.isArray(VOICE_OPTIONS) && VOICE_OPTIONS.length >= 2, '注册表至少含 sine 与 piano');
   const ids = VOICE_OPTIONS.map((option) => option.id);
+  assert.ok(Array.isArray(VOICE_OPTIONS) && VOICE_OPTIONS.length >= 3, '注册表至少含 sine 与 piano、chime');
+  assert.deepEqual(ids, ['sine', 'piano', 'chime'], '注册表顺序即设置列表顺序');
   assert.equal(new Set(ids).size, ids.length, '注册表 id 不得重复');
   for (const option of VOICE_OPTIONS) {
     assert.equal(typeof option.id, 'string');
@@ -487,6 +488,7 @@ test('音色切换：默认正弦、白名单钳制、存量兼容与持久化',
   assert.equal(legacy.get().voice, DEFAULTS.voice, '缺 voice 字段的存量数据回退默认音色');
   assert.equal(DEFAULTS.voice, 'sine', '默认音色必须仍是 sine（不打扰存量用户听感）');
   assert.equal(VOICES.piano, 'piano');
+  assert.equal(normalizeVoice('chime'), 'chime');
 
   // 切换 → 持久化 → 重载保持。
   const storage = memoryStorage();
@@ -608,6 +610,51 @@ test('音频引擎：正弦单振荡器，钢琴六分音、频率失谐且满�
     voice: () => { throw new Error('boom'); },
   });
   assert.equal(throwing.play(440), false, '取值抛错只静音，不外抛');
+});
+
+test('音频引擎：清音 = 主音 + 1.5× 钟类分音 + 上方五度引导音（Σ 归一不削波）', async () => {
+  const { createEngine, VOICES, PEAK_FACTOR, CHIME_PEAK_SCALE, CHIME_WEIGHTS, CHIME_WEIGHT_SUM, CHIME_RATIOS, CHIME_LEAD_RATIO, CHIME_LEAD_S, CHIME_ATTACK_S, CHIME_DECAY_S, ATTACK_S } =
+    (await loaded).internals;
+  const { context, nodes } = fakeAudio();
+  const engine = createEngine({
+    AudioContext: function Fake() { return context; },
+    volume: () => 1,
+    voice: () => VOICES.chime,
+  });
+  assert.equal(engine.play(440), true);
+  // 主音分音 + 引导音。
+  assert.equal(nodes.oscillators.length, CHIME_WEIGHTS.length + 1, '清音 = 2 个主音分音 + 1 个引导音');
+  for (let i = 0; i < CHIME_RATIOS.length; i += 1) {
+    assert.ok(
+      Math.abs(nodes.oscillators[i].hz - 440 * CHIME_RATIOS[i]) < 1e-6,
+      `主音第 ${i + 1} 分音频率 = f0 × ${CHIME_RATIOS[i]}`,
+    );
+  }
+  assert.ok(
+    Math.abs(nodes.oscillators[CHIME_RATIOS.length].hz - 440 * CHIME_LEAD_RATIO) < 1e-6,
+    '引导音 = 主音 × 1.5（上方五度）',
+  );
+  assert.equal(nodes.gains.length, nodes.oscillators.length + 1, '分音/引导音 gain + master gain');
+  // master 包络：0.0001 → 30ms 线性升峰 → 850ms 指数衰减（软钟音轮廓）。
+  const master = nodes.gains[0];
+  const masterPeak = master.gain.values[1];
+  assert.ok(Math.abs(masterPeak - PEAK_FACTOR * CHIME_PEAK_SCALE) < 1e-12, 'master 峰值 = PEAK_FACTOR × CHIME_PEAK_SCALE');
+  assert.ok(masterPeak < 1, '满音量不削波');
+  // 主音分音权重按 Σ 归一，和恰为 1。
+  let weightSum = 0;
+  for (let i = 0; i < CHIME_WEIGHTS.length; i += 1) {
+    const values = nodes.gains[i + 1].gain.values;
+    assert.equal(values.length, 1, '清音主音分音 gain 恒值（钟类质感全程保留）');
+    weightSum += values[0];
+    assert.ok(Math.abs(values[0] - CHIME_WEIGHTS[i] / CHIME_WEIGHT_SUM) < 1e-12, `第 ${i + 1} 分音权重归一`);
+  }
+  assert.ok(Math.abs(weightSum - 1) < 1e-12, '归一后权重和恰为 1');
+  // 引导音：软起音 + 40ms 内衰减（复刻琶音末级短音）。
+  const leadValues = nodes.gains[CHIME_WEIGHTS.length + 1].gain.values;
+  assert.ok(leadValues.length >= 3, '引导音 gain 应有升起与衰减多拍');
+  assert.ok(CHIME_ATTACK_S > ATTACK_S, '起音比 sine/piano 软');
+  assert.ok(CHIME_DECAY_S > 0.45, '余韵比 piano 长');
+  assert.ok(CHIME_LEAD_S < CHIME_ATTACK_S * 2, '引导音是短促音（≤ 2 倍起音时长）');
 });
 
 test('音频引擎：未知音色 id 兜底默认合成器，绝不抛错', async () => {
