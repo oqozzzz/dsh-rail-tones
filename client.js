@@ -19,7 +19,7 @@
 window.__ModuleLoader__.load({
   id: 'dsh-rail-tones',
   factory(require) {
-    const VERSION = '0.1.12';
+    const VERSION = '0.2.0';
 
     /* ------------------------------------------------------------------ *
      * 常量                                                                *
@@ -38,11 +38,22 @@ window.__ModuleLoader__.load({
     const SETTINGS_MAX_TRIES = 60; // 有界重试上限（约 24 秒）
     const TICK_SELECTOR = 'button[data-index]'; // 官方刻度按钮
     const STORE_KEY = 'dsh-rail-tones:v1';
-    const DEFAULTS = Object.freeze({ enabled: true, volume: 0.5 });
-    const MAX_VOLUME = 2; // 音量上限 = 200%（下限 0）；超过 100% 的部分是留给安静素材的余量
-    const PEAK_FACTOR = 0.22; // 音量 1.0 时的包络峰值（200% 时为 0.44，仍在满幅内）
+    const VOICES = Object.freeze({ sine: 'sine', piano: 'piano' });
+    const DEFAULTS = Object.freeze({ enabled: true, volume: 0.5, voice: VOICES.sine });
+    const MAX_VOLUME = 1; // 音量上限 = 100%（下限 0 = 无声）；范围收窄到 0–100%
+    // 音量 1.0（100%）时的包络峰值。0.88 = 旧 200% 上限峰值 0.44 的 2 倍，
+    // 即把 0%–100% 的音量差整体翻倍（最大声音再响一倍），仍在满幅之内不削波。
+    const PEAK_FACTOR = 0.88;
     const ATTACK_S = 0.006;
     const DECAY_S = 0.18;
+    // 钢琴音色：多分音加法合成 + 每分音独立衰减 + 轻微失谐（inharmonicity）。
+    const PIANO_WEIGHTS = Object.freeze([1, 0.58, 0.38, 0.23, 0.13, 0.07]);
+    // 分音权重之和：实际增益按它归一（Σ = 1）→ 任意时刻 |Σ 分音| ≤ master 峰值，不削波。
+    const PIANO_WEIGHT_SUM = PIANO_WEIGHTS.reduce((acc, value) => acc + value, 0);
+    const PIANO_TAUS = Object.freeze([1, 0.8, 0.65, 0.5, 0.4, 0.3]); // 相对 master 衰减的时间系数（高次分音先暗）
+    const PIANO_INHARM = 0.0002; // 失谐系数：f_n = 基频 × n × (1 + 系数 × n²)，钢琴质感的关键
+    const PIANO_DECAY_S = 0.45; // master 指数衰减时长（比正弦音长，琴声余韵）
+    const PIANO_PEAK_SCALE = 0.8; // 满音量峰值 = PEAK_FACTOR × 0.8 ≈ 0.70，留头部空间
 
     const MESSAGES = {
       zh: {
@@ -50,7 +61,9 @@ window.__ModuleLoader__.load({
         desc: '光标沿会话导航条竖向划过、按住拖动、点击刻度或滚轮翻阅时，播放音阶提示音。用于提示当前会话位置。',
         switchLabel: '导航条音效开关',
         volume: '音量',
-        volumeDesc: '提示音音量（0–200%，超过 100% 的部分是留给安静素材的余量）。只影响导航条音效。',
+        volumeDesc: '调整导航条音量大小',
+        voice: '钢琴音色',
+        voiceDesc: '开启后提示音从正弦音切换为钢琴音色。只影响导航条音效。',
         preview: '试听',
         previewDesc: '试听会话中段对应的提示音（关闭开关后试听同样静音）。',
         previewButton: '试听',
@@ -60,7 +73,9 @@ window.__ModuleLoader__.load({
         desc: 'Plays a scale tone as the pointer glides along the session navigation rail, while dragging on it, on a tick click, or while scrolling it, so you can hear where you are in the session.',
         switchLabel: 'Navigation rail tones switch',
         volume: 'Volume',
-        volumeDesc: 'Loudness of the rail tones (0–200%; anything above 100% is headroom for quiet material).',
+        volumeDesc: 'Adjust the volume of the navigation rail tones',
+        voice: 'Piano voice',
+        voiceDesc: 'Switches the rail tones from sine beeps to a synthesized piano voice. Affects the navigation rail tones only.',
         preview: 'Preview',
         previewDesc: 'Plays the tone for the middle of the session (silent while the switch is off).',
         previewButton: 'Preview',
@@ -76,6 +91,11 @@ window.__ModuleLoader__.load({
       if (value < 0) return 0;
       if (value > 1) return 1;
       return value;
+    }
+
+    /** 音色白名单：非法 / 缺失一律回退默认（存量数据没有 voice 字段，天然向后兼容）。 */
+    function normalizeVoice(value) {
+      return value === VOICES.sine || value === VOICES.piano ? value : null;
     }
 
     /** 位置（0 = 会话最早，1 = 会话最新）→ 音级下标。 */
@@ -203,6 +223,7 @@ window.__ModuleLoader__.load({
             typeof parsed.volume === 'number' && Number.isFinite(parsed.volume)
               ? Math.min(MAX_VOLUME, Math.max(0, parsed.volume))
               : DEFAULTS.volume,
+          voice: normalizeVoice(parsed.voice) === null ? DEFAULTS.voice : parsed.voice,
         };
       }
 
@@ -225,6 +246,7 @@ window.__ModuleLoader__.load({
           if (typeof current.volume === 'number' && Number.isFinite(current.volume)) {
             current.volume = Math.min(MAX_VOLUME, Math.max(0, current.volume));
           }
+          if (normalizeVoice(current.voice) === null) current.voice = DEFAULTS.voice;
           persist();
           const value = snapshot();
           for (const listener of Array.from(listeners)) {
@@ -300,35 +322,97 @@ window.__ModuleLoader__.load({
           volume = 0;
         }
         if (!Number.isFinite(volume) || volume <= 0) return false;
+        let voice = DEFAULTS.voice;
+        try {
+          const wanted = options.voice === undefined ? null : options.voice();
+          const normalized = normalizeVoice(wanted);
+          if (normalized !== null) voice = normalized;
+        } catch (error) {
+          /* 回退默认音色 */
+        }
         const audio = ensure();
         if (audio === null) return false;
+        const bounded = Math.min(MAX_VOLUME, Math.max(0, volume));
         try {
-          const start = audio.currentTime;
-          const peak = Math.min(MAX_VOLUME, Math.max(0, volume)) * PEAK_FACTOR;
-          const oscillator = audio.createOscillator();
-          const gain = audio.createGain();
-          oscillator.type = 'sine';
-          oscillator.frequency.setValueAtTime(hz, start);
-          gain.gain.setValueAtTime(0.0001, start);
-          gain.gain.linearRampToValueAtTime(peak, start + ATTACK_S);
-          gain.gain.exponentialRampToValueAtTime(0.0001, start + DECAY_S);
-          oscillator.connect(gain);
-          gain.connect(audio.destination);
-          oscillator.start(start);
-          oscillator.stop(start + DECAY_S + 0.02);
-          oscillator.onended = () => {
-            try {
-              oscillator.disconnect();
-              gain.disconnect();
-            } catch (error) {
-              /* 已断开 */
-            }
-          };
-          return true;
+          return voice === VOICES.piano ? playPiano(audio, hz, bounded) : playSine(audio, hz, bounded);
         } catch (error) {
           report(error);
           return false;
         }
+      }
+
+      /** 正弦音（v0.2.0 之前的唯一音色）：单振荡器 + 起音 + 指数衰减。 */
+      function playSine(audio, hz, volume) {
+        const start = audio.currentTime;
+        const peak = volume * PEAK_FACTOR;
+        const oscillator = audio.createOscillator();
+        const gain = audio.createGain();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(hz, start);
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.linearRampToValueAtTime(peak, start + ATTACK_S);
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + DECAY_S);
+        oscillator.connect(gain);
+        gain.connect(audio.destination);
+        oscillator.start(start);
+        oscillator.stop(start + DECAY_S + 0.02);
+        oscillator.onended = () => {
+          try {
+            oscillator.disconnect();
+            gain.disconnect();
+          } catch (error) {
+            /* 已断开 */
+          }
+        };
+        return true;
+      }
+
+      /**
+       * 钢琴音色：master gain 包络下并联 6 个正弦分音，
+       * 权重按 Σ 归一（任意时刻 |Σ 分音| ≤ master 峰值，不削波）、频率带轻微失谐、
+       * 高次分音按各自 τ 更快衰减（先亮后暗的琴声瞬态），并在衰减到位后才 stop（避免爆音）。
+       */
+      function playPiano(audio, hz, volume) {
+        const start = audio.currentTime;
+        const peak = volume * PEAK_FACTOR * PIANO_PEAK_SCALE;
+        const master = audio.createGain();
+        master.gain.setValueAtTime(0.0001, start);
+        master.gain.linearRampToValueAtTime(peak, start + ATTACK_S);
+        master.gain.exponentialRampToValueAtTime(0.0001, start + PIANO_DECAY_S);
+        master.connect(audio.destination);
+        const partials = [];
+        for (let i = 0; i < PIANO_WEIGHTS.length; i += 1) {
+          const n = i + 1;
+          const oscillator = audio.createOscillator();
+          const gain = audio.createGain();
+          oscillator.type = 'sine';
+          oscillator.frequency.setValueAtTime(hz * n * (1 + PIANO_INHARM * n * n), start);
+          const tau = PIANO_DECAY_S * PIANO_TAUS[i];
+          gain.gain.setValueAtTime(PIANO_WEIGHTS[i] / PIANO_WEIGHT_SUM, start);
+          gain.gain.exponentialRampToValueAtTime(0.0001, start + tau);
+          oscillator.connect(gain);
+          gain.connect(master);
+          oscillator.start(start);
+          oscillator.stop(start + tau + 0.02);
+          partials.push({ oscillator, gain });
+        }
+        // 任一分音结束即统一回收（同节流窗口内它们几乎同时收尾，逐个挂 onended 反而啰嗦）。
+        partials[0].oscillator.onended = () => {
+          for (const part of partials) {
+            try {
+              part.oscillator.disconnect();
+              part.gain.disconnect();
+            } catch (error) {
+              /* 已断开 */
+            }
+          }
+          try {
+            master.disconnect();
+          } catch (error) {
+            /* 已断开 */
+          }
+        };
+        return true;
       }
 
       return {
@@ -983,8 +1067,8 @@ window.__ModuleLoader__.load({
             h('input', {
               key: 'slider',
               type: 'range',
-              min: 0, // 下限 0
-              max: MAX_VOLUME * 100, // 上限 = 原来的 2 倍（200%）
+              min: 0, // 下限 0 = 无声
+              max: MAX_VOLUME * 100, // 上限 = 100%
               step: 5,
               value: Math.round(snapshot.volume * 100),
               'aria-label': t('volume'),
@@ -993,6 +1077,16 @@ window.__ModuleLoader__.load({
             }),
             h('span', { key: 'value', style: VALUE_STYLE }, `${Math.round(snapshot.volume * 100)}%`),
           ]),
+          h(
+            Row,
+            { key: 'voice', title: t('voice'), description: t('voiceDesc') },
+            h(Switch, {
+              checked: snapshot.voice === VOICES.piano,
+              label: t('voice'),
+              onToggle: () =>
+                state.set({ voice: state.get().voice === VOICES.piano ? VOICES.sine : VOICES.piano }),
+            }),
+          ),
           h(
             Row,
             { key: 'preview', title: t('preview'), description: t('previewDesc') },
@@ -1127,6 +1221,7 @@ window.__ModuleLoader__.load({
                 ? view.webkitAudioContext
                 : null,
           volume: () => state.get().volume,
+          voice: () => state.get().voice,
         });
         let lastTick = null;
         const recent = [];
@@ -1405,6 +1500,11 @@ window.__ModuleLoader__.load({
             state.set({ volume });
             return volume;
           },
+          setVoice: (value) => {
+            const voice = normalizeVoice(value) === null ? DEFAULTS.voice : value;
+            state.set({ voice });
+            return state.get().voice;
+          },
           play: (position) => controller.signal(typeof position === 'number' ? position : 0.5, 'debug'),
           /** 手动把当前状态上报给宿主半边（写入 ~/.dsh/rail-tones-report.json）。 */
           report: (reason) => report(typeof reason === 'string' ? reason : 'manual'),
@@ -1433,6 +1533,14 @@ window.__ModuleLoader__.load({
         DEFAULTS,
         MAX_VOLUME,
         PEAK_FACTOR,
+        VOICES,
+        PIANO_WEIGHTS,
+        PIANO_WEIGHT_SUM,
+        PIANO_TAUS,
+        PIANO_INHARM,
+        PIANO_DECAY_S,
+        PIANO_PEAK_SCALE,
+        normalizeVoice,
         STORE_KEY,
         degreeForPosition,
         noteHz,
@@ -1440,6 +1548,7 @@ window.__ModuleLoader__.load({
         preferTick,
         createController,
         createState,
+        createEngine,
         attachRailListeners,
         registerSettingsSection,
       },

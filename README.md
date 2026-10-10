@@ -7,7 +7,7 @@
 - **零素材、零依赖、零宿主服务**：Web Audio 实时合成；不 require 任何 `@deepseek-ai/*` 客户端包；宿主半边为空。
 - **只读观察**：只用 `document` 上的捕获阶段 + `passive` 委托监听，不写 DOM、不 `preventDefault`、不 `stopPropagation`，官方跳转 / 悬停预览 / 键盘聚焦行为完全不变。
 
-当前版本 **v0.1.12**；版本历史见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本 **v0.2.0**；版本历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 安装
 
@@ -26,7 +26,7 @@
 2. **光标沿导航条竖向划过**（不按键）→ 随位置发声；按住拖动同理。
 3. 点击某个刻度 → 发出该刻度对应的音（跳转行为不变）。
 4. 指针停在导轨上滚动滚轮 → 刻度滚动经过指针时发声。
-5. **设置 → 导航条音效**：开关、音量（**0–200%**，v0.1.12 起上限由 100% 提到 200%，下限 0）、试听。开关关闭后立即生效（试听同样静音）。
+5. **设置 → 导航条音效**：开关、音量（**0–100%**，0% 无声、100% 最大）、**钢琴音色开关**（v0.2.0 起，默认关闭 = 正弦音；打开后提示音切换为合成的钢琴音色）、试听。开关关闭后立即生效（试听同样静音），音色切换同样即时生效、刷新后保持。
 
 **音符以「刻度」为单位**：事件先吸附到指针所在（或最近）刻度的中线，再换算音高。
 因此同一个刻度上，光标划过、按住滑动、点击、滚轮得到的是**同一个音**。
@@ -107,7 +107,7 @@ Get-Content "$env:USERPROFILE\.dsh\rail-tones-report.json" -Raw
 
 ```js
 __dshRailTones.status()
-// { version, instances, enabled, volume, notesPlayed, lastNoteHz, lastTick,
+// { version, instances, enabled, volume, voice, notesPlayed, lastNoteHz, lastTick,
 //   railSeen, audioState,
 //   settings: { registered, attempts, error },
 //   dedup: { accepted, skippedByDegree, lastDegree, lastTickIndex,
@@ -117,6 +117,7 @@ __dshRailTones.rails()        // 页面上每个「含刻度按钮的 nav」→ 
 __dshRailTones.play(0.5)      // 手动发一声（会话中段）
 __dshRailTones.setEnabled(false)
 __dshRailTones.setVolume(0.3)
+__dshRailTones.setVoice('piano')   // v0.2.0 起：'piano' | 'sine'，返回生效值
 ```
 
 排查时看这几处：
@@ -145,7 +146,7 @@ __dshRailTones.setVolume(0.3)
 | 位置换算 | 刻度祖先中唯一的可滚动元素（`overflow-y:auto` 且 `scrollHeight > clientHeight`）作为虚拟滚动容器，`(y - rectTop + scrollTop) / scrollHeight` |
 | 虚拟滚动 | 不缓存刻度节点，每次事件重新查询；滚动时 `data-index` 只用于宿主自身渲染 |
 | 音高映射 | `degree = round(position × 9)`，`hz = 220 × 2^((SCALE[d%5] + 12·⌊d/5⌋)/12)`，`SCALE = [0,2,4,7,9]` |
-| 合成 | 单个 `sine` 振荡器 + 6ms 线性起音 + 180ms 指数衰减，峰值 = 音量 × 0.22 |
+| 合成 | **正弦**（默认）：单个 `sine` 振荡器 + 6ms 线性起音 + 180ms 指数衰减，峰值 = 音量 × 0.88。**钢琴**（v0.2.0 起可选）：6 个 `sine` 分音并联进一条 master gain（权重按 Σ 归一 → 不削波）、频率带轻微失谐（`f·n·(1+0.0002·n²)`）、高次分音按各自 τ 更快衰减（先亮后暗），master 峰值 = 音量 × 0.88 × 0.8 ≈ 0.70 |
 | 节奏控制 | **闸门 = 音级**：`degree` 没变就不发声。指针停在原处（哪怕抖出几十个 `pointermove`、哪怕宿主重渲染、哪怕刻度节点被虚拟滚动回收）都不会重复响；音级变了才响，离开导轨后再划入同一音级也会响。另有最小间隔 70ms。**注意**：监听层靠 `env.signal()` 的返回值更新锚点，适配器必须 `return controller.signal(...)` —— v0.1.11 修掉了这里漏掉的 `return`：此前锚点从不更新，这道闸门自 v0.1.5 引入起就是死的 |
 | 明确手势 | `pointerdown`（按下）与键盘激活（`click.detail === 0`）带 `repeat`：即使与上一声同音级也再响一次作为确认，仍受 70ms 最小间隔约束（v0.1.10 起 `repeat` 才真的透传到调度器；此前在 `apply` 的适配器里被丢掉，250ms 内的点击是静音的） |
 | 槽位注册 | `slots.register()` 在槽位**尚未被父级声明**时会抛错（`slot "…" is not declared`）。启动早于设置页时不能一次注册就放弃：内层按 400ms 有界重试（inject 45 次、register 12 次），成功即停，owner 折叠时清定时器；结果记在 `status().settings`。**`status.error` 只在注册成功时清空** —— 失败原文若被后续步骤覆盖，自报里就只剩 `registered:false`，无从定位（v0.1.9 踩过） |
@@ -157,11 +158,14 @@ __dshRailTones.setVolume(0.3)
 
 ## 设置与存储
 
-设置项存 `localStorage['dsh-rail-tones:v1'] = {"enabled":true,"volume":0.5}`（每个浏览器各自一份；隐私模式下退化为仅本次会话有效）。存储不可用或内容损坏时回退到默认值，绝不抛错。
+设置项存 `localStorage['dsh-rail-tones:v1'] = {"enabled":true,"volume":0.5,"voice":"sine"}`（每个浏览器各自一份；隐私模式下退化为仅本次会话有效）。存储不可用或内容损坏时回退到默认值，绝不抛错。
 
-**音量范围**：`0 … 200%`（`MAX_VOLUME = 2`，上限即原来 100% 的 2 倍；下限 0）。
-读取、写入、`__dshRailTones.setVolume()`、滑杆四处都按同一上限钳制，存量里越界的旧值读取时会被钳到新上限。
-包络峰值为 `音量 × 0.22`，因此 200% 时是 0.44，仍在满幅之内、不会削波。
+**音量范围**：`0 … 100%`（`MAX_VOLUME = 1`；0% 为无声，100% 为最大声音。v0.1.13 起由 0–200% 收窄为 0–100%）。
+读取、写入、`__dshRailTones.setVolume()`、滑杆四处都按同一上限钳制，存量里越界的旧值读取时会被钳到 100%。
+包络峰值为 `音量 × 0.88`，因此 100% 时是 0.88（较此前 0–200% 区间翻倍：旧 200% 峰值为 0.44），仍在满幅之内、不会削波。
+
+**音色**（v0.2.0 起）：`voice ∈ {"sine","piano"}`，默认 `"sine"`。读取与写入都走白名单，白名单外的值回退默认；
+存量数据没有 `voice` 字段时自动落默认音色（向后兼容）。设置页「钢琴音色」开关与 `__dshRailTones.setVoice('piano')` 切换同一状态。
 
 ## 卸载
 

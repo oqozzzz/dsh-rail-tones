@@ -423,7 +423,11 @@ test('设置存储：默认值、持久化、脏数据与非法音量兜底', as
   assert.deepEqual(state.get(), { ...DEFAULTS });
   state.set({ enabled: false });
   assert.equal(state.get().enabled, false);
-  assert.deepEqual(JSON.parse(storage.raw.get(STORE_KEY)), { enabled: false, volume: DEFAULTS.volume });
+  assert.deepEqual(JSON.parse(storage.raw.get(STORE_KEY)), {
+    enabled: false,
+    volume: DEFAULTS.volume,
+    voice: DEFAULTS.voice,
+  });
 
   const reloaded = createState(storage);
   assert.equal(reloaded.get().enabled, false);
@@ -432,21 +436,26 @@ test('设置存储：默认值、持久化、脏数据与非法音量兜底', as
   assert.deepEqual(dirty.get(), { ...DEFAULTS });
 
   const weird = createState(memoryStorage({ [STORE_KEY]: JSON.stringify({ enabled: 'yes', volume: 42 }) }));
-  assert.deepEqual(weird.get(), { enabled: DEFAULTS.enabled, volume: MAX_VOLUME });
+  assert.deepEqual(weird.get(), { enabled: DEFAULTS.enabled, volume: MAX_VOLUME, voice: DEFAULTS.voice });
 
   const negative = createState(memoryStorage());
   negative.set({ volume: -3 });
   assert.equal(negative.get().volume, 0);
 
-  // 音量范围：下限 0，上限是原来的 2 倍（200%）；区间内（含 150%）原样保留。
+  // 音量范围：下限 0 = 无声，上限 1 = 100%（v0.1.13 起由 200% 收窄）；区间内（含 80%）原样保留。
+  // 最大响度较此前翻倍：包络峰值 PEAK_FACTOR 由 0.22 提到 0.88（0%→100% 音量差 = 旧 0%→200% 的 2 倍）。
   const ranged = createState(memoryStorage());
-  ranged.set({ volume: 1.5 });
-  assert.equal(ranged.get().volume, 1.5);
+  ranged.set({ volume: 0.8 });
+  assert.equal(ranged.get().volume, 0.8);
+  ranged.set({ volume: 1 });
+  assert.equal(ranged.get().volume, 1);
   ranged.set({ volume: 99 });
   assert.equal(ranged.get().volume, MAX_VOLUME);
-  assert.equal(MAX_VOLUME, 2, '音量上限必须是原来（100%）的 2 倍');
-  const stored = createState(memoryStorage({ [STORE_KEY]: JSON.stringify({ enabled: true, volume: 5 }) }));
-  assert.equal(stored.get().volume, MAX_VOLUME, '存量越界值读取时也要钳到新上限');
+  assert.equal(MAX_VOLUME, 1, '音量上限必须是 100%');
+  const { PEAK_FACTOR } = (await loaded).internals;
+  assert.equal(PEAK_FACTOR, 0.88, '100% 时包络峰值须为旧 200% 峰值 0.44 的 2 倍（音量差翻倍）');
+  const stored = createState(memoryStorage({ [STORE_KEY]: JSON.stringify({ enabled: true, volume: 1.5 }) }));
+  assert.equal(stored.get().volume, MAX_VOLUME, '存量里越界的旧值（如 150%）读取时钳到 100%');
 
   const notified = [];
   const unsubscribe = negative.subscribe((value) => notified.push(value));
@@ -454,6 +463,137 @@ test('设置存储：默认值、持久化、脏数据与非法音量兜底', as
   unsubscribe();
   negative.set({ enabled: true });
   assert.equal(notified.length, 1);
+});
+
+test('音色切换：默认正弦、白名单钳制、存量兼容与持久化', async () => {
+  const { createState, STORE_KEY, DEFAULTS, VOICES } = (await loaded).internals;
+
+  // 存量数据（v0.2.0 之前）没有 voice 字段 → 读取时回退默认音色，不抛错。
+  const legacy = createState(memoryStorage({ [STORE_KEY]: JSON.stringify({ enabled: true, volume: 0.5 }) }));
+  assert.equal(legacy.get().voice, DEFAULTS.voice, '缺 voice 字段的存量数据回退默认音色');
+  assert.equal(DEFAULTS.voice, 'sine', '默认音色必须仍是 sine（不打扰存量用户听感）');
+  assert.equal(VOICES.piano, 'piano');
+
+  // 切换 → 持久化 → 重载保持。
+  const storage = memoryStorage();
+  const state = createState(storage);
+  state.set({ voice: VOICES.piano });
+  assert.equal(state.get().voice, 'piano');
+  assert.equal(JSON.parse(storage.raw.get(STORE_KEY)).voice, 'piano', '音色要写进存储');
+  assert.equal(createState(storage).get().voice, 'piano', '刷新后保持');
+  state.set({ voice: VOICES.sine });
+  assert.equal(state.get().voice, 'sine', '切回正弦');
+
+  // 白名单：非法值回退默认；脏数据读取同样回退。
+  state.set({ voice: 'violin' });
+  assert.equal(state.get().voice, DEFAULTS.voice, '白名单外的音色回退默认');
+  const dirty = createState(memoryStorage({ [STORE_KEY]: JSON.stringify({ voice: 42 }) }));
+  assert.equal(dirty.get().voice, DEFAULTS.voice);
+});
+
+/** 最小假 AudioContext：记录节点创建与参数，够盯住两种音色的合成差异。 */
+function fakeAudio() {
+  const nodes = { oscillators: [], gains: [] };
+  const context = {
+    currentTime: 1.5,
+    state: 'running',
+    destination: { name: 'destination' },
+    resume: () => Promise.resolve(),
+    close: () => Promise.resolve(),
+    createOscillator() {
+      const osc = {
+        type: 'sine',
+        frequency: { setValueAtTime: (value) => { osc.hz = value; } },
+        start() {},
+        stop(at) { osc.stopAt = at; },
+        connect() {},
+        disconnect() {},
+        onended: null,
+      };
+      nodes.oscillators.push(osc);
+      return osc;
+    },
+    createGain() {
+      const node = { values: [] };
+      node.gain = {
+        values: node.values,
+        setValueAtTime: (value) => { node.values.push(value); },
+        linearRampToValueAtTime: (value) => { node.values.push(value); },
+        exponentialRampToValueAtTime: (value) => { node.values.push(value); },
+      };
+      node.connect = () => {};
+      node.disconnect = () => {};
+      nodes.gains.push(node);
+      return node;
+    },
+  };
+  return { context, nodes };
+}
+
+test('音频引擎：正弦单振荡器，钢琴六分音、频率失谐且满幅不削波', async () => {
+  const { createEngine, VOICES, PEAK_FACTOR, PIANO_PEAK_SCALE, PIANO_INHARM, PIANO_WEIGHTS, PIANO_WEIGHT_SUM } =
+    (await loaded).internals;
+
+  const build = (voice) => {
+    const { context, nodes } = fakeAudio();
+    const engine = createEngine({
+      AudioContext: function FakeAudioContext() { return context; },
+      volume: () => 1,
+      voice: () => voice,
+    });
+    return { engine, context, nodes };
+  };
+
+  // 正弦（回归保护：v0.2.0 之前的唯一音色，行为必须原样）。
+  const sine = build(VOICES.sine);
+  assert.equal(sine.engine.play(440), true);
+  assert.equal(sine.nodes.oscillators.length, 1, '正弦音恰 1 个振荡器');
+  assert.equal(sine.nodes.oscillators[0].hz, 440, '正弦音频率 = 基频');
+  const sinePeak = sine.nodes.gains[0].gain.values[1];
+  assert.equal(Math.abs(sinePeak - PEAK_FACTOR) < 1e-12, true, '正弦满音量峰值 = PEAK_FACTOR');
+
+  // 钢琴：6 个分音振荡器 + 1 条 master gain。
+  const piano = build(VOICES.piano);
+  assert.equal(piano.engine.play(440), true);
+  assert.equal(piano.nodes.oscillators.length, PIANO_WEIGHTS.length, '钢琴音 = 6 个正弦分音');
+  assert.equal(piano.nodes.gains.length, PIANO_WEIGHTS.length + 1, '分音 gain + master gain');
+  for (let i = 0; i < PIANO_WEIGHTS.length; i += 1) {
+    const n = i + 1;
+    const expected = 440 * n * (1 + PIANO_INHARM * n * n);
+    assert.ok(
+      Math.abs(piano.nodes.oscillators[i].hz - expected) < 1e-6,
+      `第 ${n} 分音频率应带失谐：${piano.nodes.oscillators[i].hz} ≈ ${expected}`,
+    );
+  }
+  // master 包络峰值 = 1 × PEAK_FACTOR × PIANO_PEAK_SCALE，且分音权重按 Σ 归一 → 任意时刻 |Σ| ≤ 峰值。
+  // （playPiano 先建 master 再建分音 → gains[0] 是 master，gains[i+1] 是第 i 分音。）
+  const master = piano.nodes.gains[0];
+  const masterPeak = master.gain.values[1];
+  assert.ok(Math.abs(masterPeak - PEAK_FACTOR * PIANO_PEAK_SCALE) < 1e-12, 'master 峰值 ≈ 0.704');
+  assert.ok(masterPeak < 1, '满音量不削波');
+  let weightSum = 0;
+  for (let i = 0; i < PIANO_WEIGHTS.length; i += 1) {
+    // 分音 gain：setValueAtTime(权重/Σ) + 一条指数衰减到 0.0001。
+    const values = piano.nodes.gains[i + 1].gain.values;
+    assert.equal(values.length, 2, '分音 gain 应有权重与衰减两拍');
+    weightSum += values[0];
+    assert.ok(Math.abs(values[0] - PIANO_WEIGHTS[i] / PIANO_WEIGHT_SUM) < 1e-12, `第 ${i + 1} 分音权重归一`);
+  }
+  assert.ok(Math.abs(weightSum - 1) < 1e-12, '归一后权重和恰为 1');
+
+  // 音量 0 → 两种音色都静音；volume() 抛错也不炸。
+  const zero = createEngine({
+    AudioContext: function Fake() { return fakeAudio().context; },
+    volume: () => 0,
+    voice: () => VOICES.piano,
+  });
+  assert.equal(zero.play(440), false);
+  const throwing = createEngine({
+    AudioContext: function Fake() { return fakeAudio().context; },
+    volume: () => { throw new Error('boom'); },
+    voice: () => { throw new Error('boom'); },
+  });
+  assert.equal(throwing.play(440), false, '取值抛错只静音，不外抛');
 });
 
 test('清单契约：package.json、patch 与客户端产物', () => {
