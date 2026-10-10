@@ -19,7 +19,7 @@
 window.__ModuleLoader__.load({
   id: 'dsh-rail-tones',
   factory(require) {
-    const VERSION = '0.2.0';
+    const VERSION = '0.2.1';
 
     /* ------------------------------------------------------------------ *
      * 常量                                                                *
@@ -38,8 +38,19 @@ window.__ModuleLoader__.load({
     const SETTINGS_MAX_TRIES = 60; // 有界重试上限（约 24 秒）
     const TICK_SELECTOR = 'button[data-index]'; // 官方刻度按钮
     const STORE_KEY = 'dsh-rail-tones:v1';
-    const VOICES = Object.freeze({ sine: 'sine', piano: 'piano' });
-    const DEFAULTS = Object.freeze({ enabled: true, volume: 0.5, voice: VOICES.sine });
+    // 音效注册表：新增音效 = 这里加一条 + 引擎 SYNTHESIZERS 加一个合成器 + 中英文案各一条；
+    // 设置页的展开式选择列表与存储白名单都从这里派生，UI/存储代码零改动。顺序即列表顺序。
+    const VOICE_OPTIONS = Object.freeze([
+      Object.freeze({ id: 'sine', labelKey: 'voiceSine', descKey: 'voiceSineDesc' }),
+      Object.freeze({ id: 'piano', labelKey: 'voicePiano', descKey: 'voicePianoDesc' }),
+    ]);
+    const VOICES = Object.freeze(
+      VOICE_OPTIONS.reduce((acc, option) => {
+        acc[option.id] = option.id;
+        return acc;
+      }, {}),
+    );
+    const DEFAULTS = Object.freeze({ enabled: true, volume: 0.5, voice: VOICE_OPTIONS[0].id });
     const MAX_VOLUME = 1; // 音量上限 = 100%（下限 0 = 无声）；范围收窄到 0–100%
     // 音量 1.0（100%）时的包络峰值。0.88 = 旧 200% 上限峰值 0.44 的 2 倍，
     // 即把 0%–100% 的音量差整体翻倍（最大声音再响一倍），仍在满幅之内不削波。
@@ -62,8 +73,12 @@ window.__ModuleLoader__.load({
         switchLabel: '导航条音效开关',
         volume: '音量',
         volumeDesc: '调整导航条音量大小',
-        voice: '钢琴音色',
-        voiceDesc: '开启后提示音从正弦音切换为钢琴音色。只影响导航条音效。',
+        voice: '音效选择',
+        voiceDesc: '点击展开列表，选择导航条提示音的音色。',
+        voiceSine: '正弦音',
+        voiceSineDesc: '清脆的单一正弦波，默认音色',
+        voicePiano: '钢琴',
+        voicePianoDesc: '多分音合成的钢琴质感',
         preview: '试听',
         previewDesc: '试听会话中段对应的提示音（关闭开关后试听同样静音）。',
         previewButton: '试听',
@@ -74,8 +89,12 @@ window.__ModuleLoader__.load({
         switchLabel: 'Navigation rail tones switch',
         volume: 'Volume',
         volumeDesc: 'Adjust the volume of the navigation rail tones',
-        voice: 'Piano voice',
-        voiceDesc: 'Switches the rail tones from sine beeps to a synthesized piano voice. Affects the navigation rail tones only.',
+        voice: 'Sound',
+        voiceDesc: 'Click to expand the list and pick the tone voice for the rail.',
+        voiceSine: 'Sine',
+        voiceSineDesc: 'A clean single sine beep (default)',
+        voicePiano: 'Piano',
+        voicePianoDesc: 'Multi-partial synthesized piano',
         preview: 'Preview',
         previewDesc: 'Plays the tone for the middle of the session (silent while the switch is off).',
         previewButton: 'Preview',
@@ -93,9 +112,12 @@ window.__ModuleLoader__.load({
       return value;
     }
 
-    /** 音色白名单：非法 / 缺失一律回退默认（存量数据没有 voice 字段，天然向后兼容）。 */
+    /** 音色白名单派生自注册表：非法 / 缺失一律回退默认（存量数据没有 voice 字段，天然向后兼容）。 */
     function normalizeVoice(value) {
-      return value === VOICES.sine || value === VOICES.piano ? value : null;
+      for (const option of VOICE_OPTIONS) {
+        if (option.id === value) return value;
+      }
+      return null;
     }
 
     /** 位置（0 = 会话最早，1 = 会话最新）→ 音级下标。 */
@@ -313,6 +335,13 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 合成器注册表：音效 id → (audio, hz, volume) => boolean。
+       * 新音效（含未来的自定义音效）在这里挂上对应的 play* 实现即可，
+       * 分发与 UI 都不需要再改。
+       */
+      const SYNTHESIZERS = { sine: playSine, piano: playPiano };
+
       function play(hz) {
         if (typeof hz !== 'number' || !Number.isFinite(hz)) return false;
         let volume = 0;
@@ -333,8 +362,10 @@ window.__ModuleLoader__.load({
         const audio = ensure();
         if (audio === null) return false;
         const bounded = Math.min(MAX_VOLUME, Math.max(0, volume));
+        // 分发查注册表：未知 id（如未接上合成器的新音效）兜底默认合成器，绝不抛错。
+        const synth = SYNTHESIZERS[voice] === undefined ? SYNTHESIZERS[DEFAULTS.voice] : SYNTHESIZERS[voice];
         try {
-          return voice === VOICES.piano ? playPiano(audio, hz, bounded) : playSine(audio, hz, bounded);
+          return synth(audio, hz, bounded);
         } catch (error) {
           report(error);
           return false;
@@ -898,6 +929,52 @@ window.__ModuleLoader__.load({
       background: 'var(--dsw-alias-bg-layer-1, transparent)',
     };
     const VERSION_STYLE = { fontSize: '11px', opacity: 0.45 };
+    // 音效选择器：收起 = 触发按钮（当前音效名 + ▾），展开 = 绝对定位的候选面板。
+    const PICKER_WRAP_STYLE = { position: 'relative', display: 'inline-flex' };
+    const PICKER_TRIGGER_STYLE = {
+      ...BUTTON_STYLE,
+      minWidth: '96px',
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '8px',
+    };
+    const PICKER_PANEL_STYLE = {
+      position: 'absolute',
+      top: 'calc(100% + 4px)',
+      right: 0,
+      zIndex: 10,
+      minWidth: '180px',
+      display: 'flex',
+      flexDirection: 'column',
+      padding: '4px',
+      border: '1px solid var(--dsw-alias-border-secondary, rgba(127, 127, 127, 0.35))',
+      borderRadius: '10px',
+      background: 'var(--dsw-alias-bg-layer-2, var(--dsw-alias-bg-layer-1, #fff))',
+      boxShadow: '0 6px 20px rgba(0, 0, 0, 0.18)',
+    };
+    const PICKER_OPTION_STYLE = {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '10px',
+      width: '100%',
+      padding: '6px 8px',
+      fontSize: '12px',
+      borderRadius: '7px',
+      cursor: 'pointer',
+      color: 'inherit',
+      border: 'none',
+      background: 'transparent',
+      textAlign: 'left',
+    };
+    const PICKER_OPTION_TEXT_STYLE = { display: 'flex', flexDirection: 'column', gap: '1px', minWidth: 0 };
+    const PICKER_OPTION_DESC_STYLE = { fontSize: '11px', opacity: 0.55 };
+    const PICKER_CHECK_STYLE = {
+      flex: '0 0 auto',
+      color: 'var(--dsw-alias-brand-primary, #4d6bfe)',
+      fontWeight: 700,
+    };
 
     /** 把一个异常压成一行可上报的文本（消息 + 栈顶三行）。 */
     function describeError(error) {
@@ -1032,6 +1109,96 @@ window.__ModuleLoader__.load({
         );
       }
 
+      /**
+       * 音效选择器：点击展开候选列表，点选即生效并收起；点击面板外或按 Esc 收起。
+       * 候选项遍历 VOICE_OPTIONS（注册表）—— 新增音效不需要改这里。
+       */
+      function VoicePicker(props) {
+        const [open, setOpen] = React.useState(false);
+        const wrap = { current: null };
+        React.useEffect(() => {
+          if (!open) return undefined;
+          let offPointer = () => {};
+          let offKey = () => {};
+          try {
+            // 捕获阶段监听：宿主若有自己的下拉/弹层逻辑也先于它们收到，只用于「点外面收起」。
+            const onPointer = (event) => {
+              const node = wrap.current;
+              if (node === null || event.target === undefined || event.target === null) return;
+              try {
+                if (!node.contains(event.target)) setOpen(false);
+              } catch (error) {
+                /* 游离节点：忽略这一次 */
+              }
+            };
+            const onKey = (event) => {
+              if (event.key === 'Escape') setOpen(false);
+            };
+            document.addEventListener('pointerdown', onPointer, true);
+            document.addEventListener('keydown', onKey, true);
+            offPointer = () => document.removeEventListener('pointerdown', onPointer, true);
+            offKey = () => document.removeEventListener('keydown', onKey, true);
+          } catch (error) {
+            /* document 不可用：仅保留「点选收起」途径 */
+          }
+          return () => {
+            offPointer();
+            offKey();
+          };
+        }, [open]);
+        const current = props.options.find((option) => option.id === props.value) || props.options[0];
+        return h(
+          'div',
+          { key: 'picker', ref: (node) => { wrap.current = node; }, style: PICKER_WRAP_STYLE },
+          h(
+            'button',
+            {
+              type: 'button',
+              'aria-haspopup': 'listbox',
+              'aria-expanded': open ? 'true' : 'false',
+              'aria-label': t('voice'),
+              onClick: () => setOpen(!open),
+              style: PICKER_TRIGGER_STYLE,
+            },
+            [
+              h('span', { key: 'label' }, t(current.labelKey)),
+              h('span', { key: 'arrow', 'aria-hidden': true, style: { opacity: 0.55 } }, open ? '▴' : '▾'),
+            ],
+          ),
+          open
+            ? h(
+                'div',
+                { role: 'listbox', 'aria-label': t('voice'), style: PICKER_PANEL_STYLE },
+                props.options.map((option) =>
+                  h(
+                    'button',
+                    {
+                      key: option.id,
+                      type: 'button',
+                      role: 'option',
+                      'aria-selected': option.id === props.value ? 'true' : 'false',
+                      onClick: () => {
+                        props.onPick(option.id);
+                        setOpen(false);
+                      },
+                      style: PICKER_OPTION_STYLE,
+                    },
+                    [
+                      h('span', { key: 'text', style: PICKER_OPTION_TEXT_STYLE }, [
+                        h('span', { key: 'name' }, t(option.labelKey)),
+                        h('span', { key: 'desc', style: PICKER_OPTION_DESC_STYLE }, t(option.descKey)),
+                      ]),
+                      option.id === props.value
+                        ? h('span', { key: 'check', 'aria-hidden': true, style: PICKER_CHECK_STYLE }, '✓')
+                        : null,
+                    ],
+                  ),
+                ),
+              )
+            : null,
+        );
+      }
+
       function Row(props) {
         return h('div', { style: ROW_STYLE }, [
           h('div', { key: 'text', style: TEXT_STYLE }, [
@@ -1080,11 +1247,10 @@ window.__ModuleLoader__.load({
           h(
             Row,
             { key: 'voice', title: t('voice'), description: t('voiceDesc') },
-            h(Switch, {
-              checked: snapshot.voice === VOICES.piano,
-              label: t('voice'),
-              onToggle: () =>
-                state.set({ voice: state.get().voice === VOICES.piano ? VOICES.sine : VOICES.piano }),
+            h(VoicePicker, {
+              value: snapshot.voice,
+              options: VOICE_OPTIONS,
+              onPick: (id) => state.set({ voice: id }),
             }),
           ),
           h(
@@ -1534,6 +1700,7 @@ window.__ModuleLoader__.load({
         MAX_VOLUME,
         PEAK_FACTOR,
         VOICES,
+        VOICE_OPTIONS,
         PIANO_WEIGHTS,
         PIANO_WEIGHT_SUM,
         PIANO_TAUS,

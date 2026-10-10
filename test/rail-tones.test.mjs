@@ -466,7 +466,21 @@ test('设置存储：默认值、持久化、脏数据与非法音量兜底', as
 });
 
 test('音色切换：默认正弦、白名单钳制、存量兼容与持久化', async () => {
-  const { createState, STORE_KEY, DEFAULTS, VOICES } = (await loaded).internals;
+  const { createState, STORE_KEY, DEFAULTS, VOICES, VOICE_OPTIONS, normalizeVoice } = (await loaded).internals;
+
+  // 注册表：每项有 id/labelKey/descKey，id 唯一，默认 = 第一项；VOICES 由注册表派生。
+  assert.ok(Array.isArray(VOICE_OPTIONS) && VOICE_OPTIONS.length >= 2, '注册表至少含 sine 与 piano');
+  const ids = VOICE_OPTIONS.map((option) => option.id);
+  assert.equal(new Set(ids).size, ids.length, '注册表 id 不得重复');
+  for (const option of VOICE_OPTIONS) {
+    assert.equal(typeof option.id, 'string');
+    assert.equal(typeof option.labelKey, 'string', '每项必须带文案键（新增音效零 UI 改动的前提）');
+    assert.equal(typeof option.descKey, 'string');
+    assert.equal(VOICES[option.id], option.id, 'VOICES 派生自注册表');
+  }
+  assert.equal(DEFAULTS.voice, VOICE_OPTIONS[0].id, '默认音色 = 注册表第一项');
+  assert.equal(normalizeVoice('piano'), 'piano');
+  assert.equal(normalizeVoice('harp'), null, '注册表外 id → null');
 
   // 存量数据（v0.2.0 之前）没有 voice 字段 → 读取时回退默认音色，不抛错。
   const legacy = createState(memoryStorage({ [STORE_KEY]: JSON.stringify({ enabled: true, volume: 0.5 }) }));
@@ -594,6 +608,21 @@ test('音频引擎：正弦单振荡器，钢琴六分音、频率失谐且满�
     voice: () => { throw new Error('boom'); },
   });
   assert.equal(throwing.play(440), false, '取值抛错只静音，不外抛');
+});
+
+test('音频引擎：未知音色 id 兜底默认合成器，绝不抛错', async () => {
+  const { createEngine, DEFAULTS } = (await loaded).internals;
+  const { context, nodes } = fakeAudio();
+  const engine = createEngine({
+    AudioContext: function Fake() { return context; },
+    volume: () => 1,
+    // 绕过 state 白名单直喂引擎：注册表外的 id（如未来只加了注册项还没挂合成器的音效）。
+    voice: () => 'harp',
+  });
+  assert.equal(engine.play(440), true, '未知 id 仍要出声（兜底默认）');
+  assert.equal(nodes.oscillators.length, 1, '兜底 = 默认 sine 合成器：恰 1 个振荡器');
+  assert.equal(nodes.oscillators[0].hz, 440);
+  assert.equal(DEFAULTS.voice, 'sine');
 });
 
 test('清单契约：package.json、patch 与客户端产物', () => {
