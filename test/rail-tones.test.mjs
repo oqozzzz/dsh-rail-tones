@@ -509,7 +509,7 @@ test('音色切换：默认正弦、白名单钳制、存量兼容与持久化',
 
 /** 最小假 AudioContext：记录节点创建与参数，够盯住两种音色的合成差异。 */
 function fakeAudio() {
-  const nodes = { oscillators: [], gains: [] };
+  const nodes = { oscillators: [], gains: [], filters: [] };
   const context = {
     currentTime: 1.5,
     state: 'running',
@@ -520,6 +520,8 @@ function fakeAudio() {
       const osc = {
         type: 'sine',
         frequency: { setValueAtTime: (value) => { osc.hz = value; } },
+        // v0.2.6：刮弦音首分音带失谐（mimo 原文 I.detune.value=1.5）。
+        detune: { setValueAtTime: (value) => { osc.detuned = value; } },
         start() {},
         stop(at) { osc.stopAt = at; },
         connect() {},
@@ -540,6 +542,18 @@ function fakeAudio() {
       node.connect = () => {};
       node.disconnect = () => {};
       nodes.gains.push(node);
+      return node;
+    },
+    // v0.2.6：刮弦音的 lowpass 滤波器（4200→1400Hz 扫频）。
+    createBiquadFilter() {
+      const node = { type: '', frequencyValues: [] };
+      node.frequency = {
+        setValueAtTime: (value) => { node.frequencyValues.push(value); },
+        exponentialRampToValueAtTime: (value) => { node.frequencyValues.push(value); },
+      };
+      node.connect = () => {};
+      node.disconnect = () => {};
+      nodes.filters.push(node);
       return node;
     },
   };
@@ -748,58 +762,56 @@ test('mimo 滑动速度门槛：逐字移植原文 Le/qe/Ve/fe（慢速放行、
   assert.equal(MIMO_GATE_WINDOW_MS, 80, '原文 He');
   assert.equal(MIMO_GATE_MAX_SPEED, 600, '原文 je');
 
-  // 慢速移动 → 放行（原文「速度 < 600px/s ⇒ true」）。
-  // 起手帧 t=0；t=140 时已过 100ms 观察窗，窗口内保留 t=60 与 t=140 两帧：
-  // 60ms 内移动 6px = 100px/s < 600 → 放行。
+  // v0.2.6 起裁决为三态：'mute'（起步窗内，原文静音）/ 'strum'（快速甩动，本项目改播刮弦音）/
+  // 'pass'（慢速放行，正常单音）。原文的 false 拆成了前两态。
   const gate = createMimoGate({});
-  assert.equal(gate.allow({ x: 0, y: 0 }, 0), false, '进入瞬间静音');
-  assert.equal(gate.allow({ x: 0, y: 50 }, 50), false, '仍在 100ms 内');
-  assert.equal(gate.allow({ x: 0, y: 56 }, 140), true, '慢速划过放行（100px/s）');
-  // 快速甩动 → 静音：60ms 内 60px = 1000px/s，且两帧都在 80ms 取样窗口内。
+  assert.equal(gate.allow({ x: 0, y: 0 }, 0), 'mute', '进入瞬间静音');
+  assert.equal(gate.allow({ x: 0, y: 50 }, 50), 'mute', '仍在 100ms 内');
+  assert.equal(gate.allow({ x: 0, y: 56 }, 140), 'pass', '慢速划过放行（100px/s）');
+  // 快速甩动 → 'strum'：60ms 内 60px = 1000px/s，且两帧都在 80ms 取样窗口内。
   const fast = createMimoGate({});
-  fast.allow({ x: 0, y: 0 }, 0);
-  assert.equal(fast.allow({ x: 0, y: 50 }, 50), false, '仍在 100ms 内');
-  assert.equal(fast.allow({ x: 0, y: 110 }, 110), false, '60ms/60px = 1000px/s > 600 → 静音');
-  assert.equal(fast.allow({ x: 0, y: 170 }, 170), false, '持续快速划过 → 继续静音');
-  // 临界：恰好 600px/s 静音（原文严格小于），583px/s 放行。
-  // 两帧都落在 80ms 取样窗口内，且已过 100ms 观察窗（t=100 与 t=160，间隔 60ms）。
+  assert.equal(fast.allow({ x: 0, y: 0 }, 0), 'mute');
+  assert.equal(fast.allow({ x: 0, y: 50 }, 50), 'mute', '仍在 100ms 内');
+  assert.equal(fast.allow({ x: 0, y: 110 }, 110), 'strum', '60ms/60px = 1000px/s > 600 → 刮弦音');
+  assert.equal(fast.allow({ x: 0, y: 170 }, 170), 'strum', '持续快速划过 → 继续刮弦音');
+  // 临界：恰好 600px/s 判快速（原文严格小于），583px/s 放行。
   const boundary = (px) => {
     const probe = createMimoGate({});
     probe.allow({ x: 0, y: 0 }, 0); // 记 entryAt
     probe.allow({ x: 0, y: 0 }, 100); // 窗口内首帧
     return probe.allow({ x: 0, y: px }, 160); // 60ms 后
   };
-  assert.equal(boundary(35), true, '583px/s → 放行');
-  assert.equal(boundary(36), false, '恰好 600px/s → 静音（严格 <）');
-  assert.equal(boundary(37), false, '617px/s → 静音');
+  assert.equal(boundary(35), 'pass', '583px/s → 放行');
+  assert.equal(boundary(36), 'strum', '恰好 600px/s → 快速（严格 <）');
+  assert.equal(boundary(37), 'strum', '617px/s → 快速');
 
-  // 持续慢速划动始终放行；持续快速划动：过了观察窗后立刻被拦。
+  // 持续慢速划动始终放行。
   const slow = createMimoGate({});
   slow.allow({ x: 0, y: 0 }, 0);
-  assert.equal(slow.allow({ x: 0, y: 4 }, 100), true);
-  assert.equal(slow.allow({ x: 0, y: 8 }, 160), true);
+  assert.equal(slow.allow({ x: 0, y: 4 }, 100), 'pass');
+  assert.equal(slow.allow({ x: 0, y: 8 }, 160), 'pass');
   const flick = createMimoGate({});
   flick.allow({ x: 0, y: 0 }, 0);
-  assert.equal(flick.allow({ x: 0, y: 100 }, 100), true, '窗口内只有一帧 → 原文放行');
-  assert.equal(flick.allow({ x: 0, y: 200 }, 160), false, '两帧入窗后 → 1000px/s 静音');
+  assert.equal(flick.allow({ x: 0, y: 100 }, 100), 'pass', '窗口内只有一帧 → 原文放行');
+  assert.equal(flick.allow({ x: 0, y: 200 }, 160), 'strum', '两帧入窗后 → 1000px/s 快速');
 
   // 单帧（样本 <2）放行 —— 原文 `samples.length < 2 ⇒ true`。
   const single = createMimoGate({});
-  assert.equal(single.allow({ x: 0, y: 0 }, 0), false, '首帧仍受 entry 窗口约束');
-  assert.equal(single.allow({ x: 0, y: 0 }, 200), true, '窗口内只剩一帧 → 放行（原文语义）');
+  assert.equal(single.allow({ x: 0, y: 0 }, 0), 'mute', '首帧仍受 entry 窗口约束');
+  assert.equal(single.allow({ x: 0, y: 0 }, 200), 'pass', '窗口内只剩一帧 → 放行（原文语义）');
 
   // reset()（离开导轨 / blur，原文 fe）后重新进入 100ms 观察窗。
   const leaving = createMimoGate({});
   leaving.allow({ x: 0, y: 0 }, 0);
-  assert.equal(leaving.allow({ x: 0, y: 3 }, 120), true, '复位前慢速放行');
+  assert.equal(leaving.allow({ x: 0, y: 3 }, 120), 'pass', '复位前慢速放行');
   leaving.reset();
-  assert.equal(leaving.allow({ x: 0, y: 6 }, 140), false, '复位后重新进入 100ms 观察窗');
+  assert.equal(leaving.allow({ x: 0, y: 6 }, 140), 'mute', '复位后重新进入 100ms 观察窗');
   assert.equal(leaving.stats().samples, 1, 'reset 清空采样');
 
-  // 手势缺失 / 非法坐标一律放行（点击、滚轮、试听不走这条路）。
-  assert.equal(gate.allow(null, 0), true);
-  assert.equal(gate.allow(undefined, 0), true);
-  assert.equal(createMimoGate({}).allow({ x: Number.NaN, y: 0 }, 0), true);
+  // 手势缺失 / 非法坐标一律 'pass'（点击、滚轮、试听不走这条路）。
+  assert.equal(gate.allow(null, 0), 'pass');
+  assert.equal(gate.allow(undefined, 0), 'pass');
+  assert.equal(createMimoGate({}).allow({ x: Number.NaN, y: 0 }, 0), 'pass');
 });
 
 test('音频引擎：mimo 音色 = 三角波 + 原文双档包络与绝对增益', async () => {
@@ -1040,22 +1052,23 @@ test('接线：走真实 apply，音色切换后 debug().play() 用该音色的�
   boot.shutdown();
 });
 
-test('调度器：滑动速度门槛只作用于「划过」（gesture.hover）', async () => {
+test('调度器：滑动速度门槛只作用于「划过」（gesture.hover），裁决透传 meta', async () => {
   const { createController } = (await loaded).internals;
   const played = [];
   let clock = 0;
   const asked = [];
   const controller = createController({
-    play: (hz) => played.push(hz),
+    play: (hz, meta) => played.push({ hz, ...meta }),
     now: () => clock,
     isEnabled: () => true,
+    // v0.2.6 三态裁决桩：y≤100 'mute'、y≥400 'strum'、其余 'pass'。
     gate: (gesture, at) => {
       asked.push({ gesture, at });
-      return gesture.y > 100; // 模拟速度门槛：只有「够慢/够靠下」才放行
+      return gesture.y <= 100 ? 'mute' : gesture.y >= 400 ? 'strum' : 'pass';
     },
   });
 
-  // 划过带 hover 标记 → 被门槛拦下时不发声、也不更新去重键。
+  // 划过带 hover 标记 → 被门槛拦下时不发声、也不更新去重锚点。
   assert.equal(controller.signal(0.2, 'hover', 1, undefined, { hover: true, x: 0, y: 10 }), false);
   assert.equal(played.length, 0);
   assert.equal(asked.length, 1, '划过才问门槛');
@@ -1063,6 +1076,11 @@ test('调度器：滑动速度门槛只作用于「划过」（gesture.hover）'
   assert.equal(controller.signal(0.2, 'hover', 1, undefined, { hover: true, x: 0, y: 300 }), true);
   assert.equal(played.length, 1);
   assert.equal(asked.length, 2, '第二次划过又问了一次');
+  assert.equal(played[0].gate, 'pass', 'meta 带上裁决');
+  // 快速划过 → 裁决 'strum' 也发声（本项目增强：改播刮弦音），meta 原样带出。
+  clock = 400;
+  assert.equal(controller.signal(0.5, 'hover', 2, undefined, { hover: true, x: 0, y: 400 }), true);
+  assert.equal(played[1].gate, 'strum', '快速划过的裁决透传给音色分发');
   // 点击 / 滚轮 / 试听：上下文里 hover=false（或没有上下文）→ 一律不判门槛。
   const askedAfterHover = asked.length;
   clock = 500;
@@ -1192,6 +1210,259 @@ test('接线：走真实 apply，划过 / 按下各自发声（明确手势给�
   boot.rail.dispatch('pointerdown', { target: boot.rail.ticks[2], clientY: 25, clientX: 7 });
   assert.equal(boot.debug().status().notesPlayed, 2, '按下给确认音（不走速度门槛）');
   assert.equal(boot.debug().log(1)[0].source, 'slide');
+  boot.shutdown();
+});
+
+test('音频引擎：mimo 刮弦音 = 5 分音 × 频率 + lowpass 扫频，峰值按 √len 归一', async () => {
+  const {
+    createEngine,
+    VOICES,
+    MIMO_HOVER_GAIN,
+    MIMO_HIT_GAIN,
+    MIMO_STRUM_BASE_S,
+    MIMO_STRUM_MIN_S,
+    MIMO_STRUM_MAX_S,
+    MIMO_STRUM_ATTACK_S,
+    MIMO_STRUM_FILTER_FROM_HZ,
+    MIMO_STRUM_FILTER_TO_HZ,
+    MIMO_STRUM_FILTER_SPAN,
+    MIMO_STRUM_DETUNE_CENTS,
+    MIMO_STRUM_PARTIALS,
+    MIMO_STOP_PAD_S,
+  } = (await loaded).internals;
+
+  const build = (volume) => {
+    const { context, nodes } = fakeAudio();
+    const engine = createEngine({
+      AudioContext: function FakeAudioContext() { return context; },
+      volume: () => volume,
+      voice: () => VOICES.mimo,
+    });
+    return { engine, context, nodes };
+  };
+
+  // 单频刮弦（快速滑动的本项目增强路径）：5 个分音 + 1 条 master gain + 1 个 lowpass。
+  const one = build(1);
+  assert.equal(one.engine.play(440, { strum: { freqs: [440], ring: 1.1, strong: false } }), true);
+  assert.equal(one.nodes.oscillators.length, MIMO_STRUM_PARTIALS.length, '每频 5 分音');
+  assert.equal(one.nodes.gains.length, MIMO_STRUM_PARTIALS.length + 1, '分音 gain + master gain');
+  assert.equal(one.nodes.filters.length, 1, 'lowpass 滤波器');
+  // 分音矩阵逐字对齐：倍数 / 增益 / 波形。
+  const spec = [[1, 1, 'triangle'], [2, 0.42, 'sine'], [3, 0.22, 'sine'], [4, 0.12, 'sine'], [6, 0.06, 'sine']];
+  assert.deepEqual(
+    MIMO_STRUM_PARTIALS.map((p) => [p[0], p[1], p[2]]),
+    spec,
+    '原文 J = [[1,1,triangle],[2,.42,sine],[3,.22,sine],[4,.12,sine],[6,.06,sine]]',
+  );
+  spec.forEach((partial, index) => {
+    const osc = one.nodes.oscillators[index];
+    assert.equal(osc.type, partial[2], `分音 ${index + 1} 波形`);
+    assert.ok(Math.abs(osc.hz - 440 * partial[0]) < 1e-6, `分音 ${index + 1} 频率 = f×${partial[0]}`);
+    assert.ok(Math.abs(one.nodes.gains[index + 1].gain.values[0] - partial[1]) < 1e-12, `分音 ${index + 1} 增益`);
+  });
+  assert.equal(one.nodes.oscillators[0].detuned, MIMO_STRUM_DETUNE_CENTS, '原文首分音 detune=1.5 音分');
+  assert.equal(one.nodes.oscillators[1].detuned, undefined, '失谐只作用于首分音（其余从未调用 detune）');
+  // 时长 F = clamp(0.25+ring, .4, 2.6)；ring=1.1 → 1.35s。
+  const duration = MIMO_STRUM_BASE_S + 1.1;
+  const master = one.nodes.gains[0];
+  assert.equal(master.gain.values.length, 3, 'master：1e-4 → 峰值 → 1e-4');
+  assert.ok(Math.abs(master.gain.values[1] - MIMO_HOVER_GAIN) < 1e-12, '弱音档峰值（单频 √1 不衰减）');
+  assert.ok(
+    Math.abs(one.nodes.oscillators[0].stopAt - (1.5 + duration + MIMO_STOP_PAD_S)) < 1e-9,
+    '停振 = F + 0.05',
+  );
+  // lowpass：4200 → 1400Hz（0.85F 处）—— 钉住原文字面值，别跟着常量跑。
+  assert.equal(one.nodes.filters[0].type, 'lowpass');
+  assert.deepEqual(one.nodes.filters[0].frequencyValues, [4200, 1400], '原文 L.frequency 4200→1400');
+  assert.equal(MIMO_STRUM_FILTER_FROM_HZ, 4200, '常量钉住原文');
+  assert.equal(MIMO_STRUM_FILTER_TO_HZ, 1400, '常量钉住原文');
+  assert.ok(MIMO_STRUM_FILTER_SPAN === 0.85, '原文 F*.85');
+
+  // 双频和弦：峰值按 1/√2 归一（不削波）、分音数 ×2。
+  const two = build(1);
+  two.engine.play(440, { strum: { freqs: [440, 550], ring: 0.4, strong: true } });
+  assert.equal(two.nodes.oscillators.length, MIMO_STRUM_PARTIALS.length * 2, '两频 = 10 个振荡器');
+  assert.ok(
+    Math.abs(two.nodes.gains[0].gain.values[1] - MIMO_HIT_GAIN / Math.SQRT2) < 1e-12,
+    '强音档峰值 ÷ √len',
+  );
+
+  // clamp 边界：ring 太小 → 0.4s，ring 太大 → 2.6s。
+  assert.equal(Math.max(MIMO_STRUM_MIN_S, Math.min(MIMO_STRUM_MAX_S, MIMO_STRUM_BASE_S + 0.05)), MIMO_STRUM_MIN_S);
+  assert.equal(Math.max(MIMO_STRUM_MIN_S, Math.min(MIMO_STRUM_MAX_S, MIMO_STRUM_BASE_S + 9)), MIMO_STRUM_MAX_S);
+
+  // 休止（freqs 空）→ 不建任何节点（原文 if(!d.length)return），但返回 true（手势已消耗）。
+  const rest = build(1);
+  assert.equal(rest.engine.play(440, { strum: { freqs: [], ring: 0.4, strong: false } }), true);
+  assert.equal(rest.nodes.oscillators.length, 0, '休止不建节点');
+  assert.equal(rest.nodes.filters.length, 0);
+});
+
+test('mimo 彩蛋状态机：5% 掷骰 / 180s 冷却 / 手势逐音推进 / 离开复位资格', async () => {
+  const { createMimoEgg, MIMO_EGG_SONGS, MIMO_EGG_PROBABILITY, MIMO_EGG_COOLDOWN_MS, MIMO_EGG_LOOPS } =
+    (await loaded).internals;
+  assert.equal(MIMO_EGG_PROBABILITY, 0.05, '原文 S');
+  assert.equal(MIMO_EGG_COOLDOWN_MS, 180 * 1000, '原文 V');
+  assert.equal(MIMO_EGG_LOOPS, 1, '原文 U');
+  assert.equal(MIMO_EGG_SONGS.length, 5);
+  // 曲库完整性核对（与逆向原文逐首一致）。
+  assert.deepEqual(
+    MIMO_EGG_SONGS.map((s) => [s.bpm, s.notes.length]),
+    [[76, 40], [150, 77], [120, 105], [72, 34], [72, 82]],
+    '5 首曲子的 bpm 与音数',
+  );
+  // 致爱丽丝开头：E5 D#5 E5 D#5 E5 B4 D5 C5 A4（唱名只是标签，定音看音名）。
+  assert.deepEqual(
+    MIMO_EGG_SONGS[0].notes.slice(0, 9).map((n) => Math.round(n.f[0] * 100) / 100),
+    [659.26, 622.25, 659.26, 622.25, 659.26, 493.88, 587.33, 523.25, 440],
+  );
+  // 休止 = 空频率；和弦 = 多频率。
+  assert.equal(MIMO_EGG_SONGS[0].notes[9].f.length, 0, '第 10 音是休止');
+  assert.equal(MIMO_EGG_SONGS[1].notes.filter((n) => n.f.length > 1).length, 2, '第 2 首有 2 个和弦');
+
+  let clock = 0;
+  let roll = 0;
+  const build = () =>
+    createMimoEgg({
+      now: () => clock,
+      random: () => roll,
+    });
+
+  // 未命中概率 → 不激活；每轮互动只掷一次（k 语义）。
+  const off = build();
+  roll = 0.99;
+  assert.equal(off.attempt({ strong: false, roll: true }), null, '骰子不中就按常规单音走');
+  assert.equal(off.stats().rolled, true, '本轮已掷过（k=true）');
+  assert.equal(off.attempt({ strong: false, roll: true }), null, '第二轮手势不再掷');
+  off.endEngagement();
+  assert.equal(off.stats().rolled, false, '离开导轨 → 重新获得掷骰资格');
+
+  // 命中 → 逐音推进：第一次 attempt 就奏出第一个音（原文 X(!1) 立刻播 R[0]）。
+  const egg = build();
+  roll = 0.04;
+  const first = egg.attempt({ strong: false, roll: true });
+  assert.ok(first !== null, '5% 命中 → 激活');
+  assert.deepEqual(first.freqs, MIMO_EGG_SONGS[0].notes[0].f, '默认骰 0 → 第 1 首');
+  assert.equal(first.strong, false, 'hover 推进走弱音');
+  const second = egg.attempt({ strong: false, roll: false });
+  assert.deepEqual(second.freqs, MIMO_EGG_SONGS[0].notes[1].f, '第二帧推进到第 2 音');
+  // 激活期间的 hit → 强音推进（原文 hit: i(R[x].freqs,!0,...)）。
+  clock = 500;
+  const hitNote = egg.attempt({ strong: true, roll: false });
+  assert.deepEqual(hitNote.freqs, MIMO_EGG_SONGS[0].notes[2].f);
+  assert.equal(hitNote.strong, true, '彩蛋期间的点击 = 强音推进');
+  // 掷骰选曲：rnd=0.04 命中 + 选曲用同一次 Math.random → 第 1 首；换 rnd 组合选到别的曲子。
+  const egg2 = createMimoEgg({
+    now: () => clock,
+    random: (() => {
+      let step = 0;
+      return () => {
+        step += 1;
+        return step === 1 ? 0.01 : 0.999; // 命中，但选曲落在最后一首
+      };
+    })(),
+  });
+  const pick = egg2.attempt({ strong: false, roll: true });
+  assert.deepEqual(
+    pick.freqs,
+    MIMO_EGG_SONGS[MIMO_EGG_SONGS.length - 1].notes[0].f,
+    '选曲用独立的 random() 抽样',
+  );
+
+  // 播完整曲：40 个音后自动结束 → 结束时刻记入冷却起点（原文 X 尾部 j=now）。
+  const full = build();
+  roll = 0.04;
+  clock = 0;
+  assert.ok(full.attempt({ strong: false, roll: true }) !== null);
+  for (let i = 1; i < MIMO_EGG_SONGS[0].notes.length; i += 1) {
+    clock = i * 10;
+    assert.ok(full.attempt({ strong: false, roll: false }) !== null, `第 ${i + 1} 音还在推进`);
+  }
+  const endedAt = (MIMO_EGG_SONGS[0].notes.length - 1) * 10;
+  clock = endedAt + 10;
+  assert.equal(full.attempt({ strong: false, roll: false }), null, '播完自动结束');
+  assert.equal(full.stats().active, false);
+  assert.equal(full.stats().lastFinishedAt, endedAt, '结束时刻记入冷却起点（原文 X 尾部 j=now）');
+  // 冷却未满 → 再掷不中；满 180s → 可再触发。
+  roll = 0.0;
+  full.endEngagement();
+  clock = endedAt + MIMO_EGG_COOLDOWN_MS - 1;
+  assert.equal(full.attempt({ strong: false, roll: true }), null, '冷却期内不再开新彩蛋');
+  full.endEngagement();
+  clock = endedAt + MIMO_EGG_COOLDOWN_MS;
+  assert.ok(full.attempt({ strong: false, roll: true }) !== null, '满 180s → 可再次触发');
+
+  // reset（卸载，原文 resetEgg）：打断进行中 → 冷却从打断时刻重算、状态清空。
+  const interrupt = build();
+  roll = 0.04;
+  clock = 500000;
+  assert.ok(interrupt.attempt({ strong: false, roll: true }) !== null);
+  interrupt.reset();
+  assert.equal(interrupt.stats().active, false);
+  assert.equal(interrupt.stats().lastFinishedAt, 500000, '打断也推冷却起点');
+  assert.equal(interrupt.stats().noteIndex, 0, '音序清零');
+});
+
+test('接线：走真实 apply，mimo 下快速滑动播刮弦音', async (t) => {
+  // 桩掉随机源：骰子 99% 不中，只验「快速甩动 → 刮弦音」这条确定性路径。
+  t.mock.method(Math, 'random', () => 0.99);
+  const boot = await bootPlugin();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+  boot.debug().setVoice('mimo');
+
+  // 起步 100ms 观察窗（'mute'）→ 静音。
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[2], clientY: 25, clientX: 7 });
+  assert.equal(boot.debug().status().notesPlayed, 0, '首帧静音');
+
+  // 慢速划到相邻刻度 → 'pass'：常规单音（不是刮弦）。
+  t.mock.timers.tick(200);
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[3], clientY: 35, clientX: 7 });
+  assert.equal(boot.debug().status().notesPlayed, 1);
+  assert.equal(boot.debug().log(1)[0].strum, false, '慢速 = 常规单音');
+
+  // 快速甩动：两次划过间隔 75ms（>70ms 节流、<80ms 取样窗口 → 两帧都在窗口内），
+  // 纵跳 80px ≈ 1066px/s ≥ 600 → 裁决 'strum'。mimo 本体此时静音；本项目增强为播刮弦音。
+  t.mock.timers.tick(200);
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[1], clientY: 15, clientX: 7 });
+  assert.equal(boot.debug().status().notesPlayed, 2);
+  t.mock.timers.tick(75);
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[4], clientY: 95, clientX: 7 });
+  assert.equal(boot.debug().status().notesPlayed, 3, '快速甩动不再静音，而是播刮弦音');
+  const fastLog = boot.debug().log(1)[0];
+  assert.equal(fastLog.strum, true, '快速划过 → 刮弦音路径');
+  assert.equal(fastLog.egg, false, '快速划过不掷骰也不推进彩蛋');
+
+  const stats = boot.debug().status().egg;
+  assert.equal(stats.active, false, '骰子 99% 不中：status 暴露彩蛋状态');
+  boot.shutdown();
+});
+
+test('接线：走真实 apply，彩蛋命中后手势逐音推进刮弦旋律', async (t) => {
+  // 桩掉随机源：第一次抽样命中（<0.05）、第二次选曲落第 1 首。
+  let draws = 0;
+  t.mock.method(Math, 'random', () => {
+    draws += 1;
+    return draws === 1 ? 0.01 : 0.0;
+  });
+  const boot = await bootPlugin();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+  boot.debug().setVoice('mimo');
+  const { MIMO_EGG_SONGS } = (await loaded).internals;
+
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[2], clientY: 25, clientX: 7 });
+  t.mock.timers.tick(200);
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[3], clientY: 35, clientX: 7 });
+  // 这一帧掷骰命中 → 本帧即播第 1 音（原文触发帧也调 X 播首音）。
+  assert.equal(boot.debug().status().notesPlayed, 1);
+  assert.equal(boot.debug().log(1)[0].egg, true, '命中帧改播彩蛋音');
+  assert.equal(boot.debug().status().egg.active, true);
+  assert.equal(boot.debug().status().egg.noteIndex, 1, '已推进 1 音');
+  // 激活后每帧推进（log.hz 仍是位置单音的 hz —— 它只是记录，发声走 strum）。
+  t.mock.timers.tick(200);
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[4], clientY: 45, clientX: 7 });
+  assert.equal(boot.debug().status().egg.noteIndex, 2, '下一帧推进到第 2 音');
+  assert.equal(boot.debug().log(1)[0].egg, true);
+  assert.ok(MIMO_EGG_SONGS[0].notes[1].f.length > 0);
   boot.shutdown();
 });
 

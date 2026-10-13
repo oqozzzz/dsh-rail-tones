@@ -19,7 +19,7 @@
 window.__ModuleLoader__.load({
   id: 'dsh-rail-tones',
   factory(require) {
-    const VERSION = '0.2.5';
+    const VERSION = '0.2.6';
 
     /* ------------------------------------------------------------------ *
      * 常量                                                                *
@@ -127,6 +127,388 @@ window.__ModuleLoader__.load({
     const MIMO_GATE_ENTRY_MS = 100; // 原文 ke：进入导轨后 <100ms 静音
     const MIMO_GATE_WINDOW_MS = 80; // 原文 He：速度取样窗口
     const MIMO_GATE_MAX_SPEED = 600; // 原文 je：速度 ≥600px/s 静音（慢速才放行）
+    // 刮弦合成器（v0.2.6）：逐字移植原文 i(freqs, strong, ring)（彩蛋与快速滑动共用）。
+    //   F = clamp(0.25 + ring, 0.4, 2.6)；master gain：1e-4 → (strong?.3:.13)/√len (+6ms) → 1e-4 (+F)；
+    //   其后接 lowpass：4200Hz →（+0.85F 处）1400Hz；每个频率叠 5 个分音
+    //   （基频三角波 + 2/3/4/6 次正弦泛音），首分音失谐 1.5 音分；停振 +0.05s。
+    const MIMO_STRUM_BASE_S = 0.25; // 原文 .25 + ring
+    const MIMO_STRUM_MIN_S = 0.4; // 原文 Math.max(.4, …)
+    const MIMO_STRUM_MAX_S = 2.6; // 原文 Math.min(2.6, …)
+    const MIMO_STRUM_ATTACK_S = 0.006; // 原文 v+.006
+    const MIMO_STRUM_FILTER_FROM_HZ = 4200; // 原文 L.frequency.setValueAtTime(4200, v)
+    const MIMO_STRUM_FILTER_TO_HZ = 1400; // 原文 …exponentialRamp(1400, v+F*.85)
+    const MIMO_STRUM_FILTER_SPAN = 0.85; // 原文 F*.85
+    const MIMO_STRUM_DETUNE_CENTS = 1.5; // 原文 se===0 && (I.detune.value=1.5)
+    const MIMO_STRUM_DEFAULT_RING = 1.1; // 原文默认参数 C=1.1
+    // 分音矩阵 [频率倍数, 增益, 波形]（原文 J）。
+    const MIMO_STRUM_PARTIALS = Object.freeze([
+      Object.freeze([1, 1, 'triangle']),
+      Object.freeze([2, 0.42, 'sine']),
+      Object.freeze([3, 0.22, 'sine']),
+      Object.freeze([4, 0.12, 'sine']),
+      Object.freeze([6, 0.06, 'sine']),
+    ]);
+    // 彩蛋（v0.2.6）：逐字移植原文 S/U/V 与 R/x/Y/k/j 状态机。
+    //   hover 掷骰（每次互动一轮、冷却 180s、概率 5%）命中后随机选曲；
+    //   激活期间「每次划过/点击推进一个音符」（音符由用户手势逐音奏出，不是后台自动播放）。
+    const MIMO_EGG_PROBABILITY = 0.05; // 原文 S
+    const MIMO_EGG_COOLDOWN_MS = 180 * 1000; // 原文 V
+    const MIMO_EGG_LOOPS = 1; // 原文 U：整曲播一遍
+    // 曲库：逐音移植原文 O 数组的 5 首曲子（唱名/音名记法已预解析为频率）。
+    // ① 致爱丽丝（76bpm·40 音·19.7s）② F# 小调练习曲（150bpm·77 音·20.4s）
+    // ③ 卡农式主题（120bpm·105 音·20.0s，原文由 g/P 两段组合）
+    // ④ 波莱罗片段（72bpm·34 音·20.0s）⑤ 欢乐颂变奏（72bpm·82 音·20.2s）。
+    // f = 频率数组（空 = 休止），ring = 该音的持续秒数（原文 ring，喂给刮弦合成器）。
+    const MIMO_EGG_SONGS = Object.freeze([
+      { bpm: 76, notes: [
+        { f: [659.26], ring: 0.3947 },
+        { f: [622.25], ring: 0.3947 },
+        { f: [659.26], ring: 0.3947 },
+        { f: [622.25], ring: 0.3947 },
+        { f: [659.26], ring: 0.3947 },
+        { f: [493.88], ring: 0.3947 },
+        { f: [587.33], ring: 0.3947 },
+        { f: [523.25], ring: 0.3947 },
+        { f: [440], ring: 1.1842 },
+        { f: [], ring: 0.3947 },
+        { f: [261.63], ring: 0.3947 },
+        { f: [329.63], ring: 0.3947 },
+        { f: [440], ring: 0.3947 },
+        { f: [493.88], ring: 0.7895 },
+        { f: [], ring: 0.3947 },
+        { f: [329.63], ring: 0.3947 },
+        { f: [415.3], ring: 0.3947 },
+        { f: [493.88], ring: 0.3947 },
+        { f: [523.25], ring: 0.7895 },
+        { f: [], ring: 0.3947 },
+        { f: [329.63], ring: 0.3947 },
+        { f: [659.26], ring: 0.3947 },
+        { f: [622.25], ring: 0.3947 },
+        { f: [659.26], ring: 0.3947 },
+        { f: [622.25], ring: 0.3947 },
+        { f: [659.26], ring: 0.3947 },
+        { f: [493.88], ring: 0.3947 },
+        { f: [587.33], ring: 0.3947 },
+        { f: [523.25], ring: 0.3947 },
+        { f: [440], ring: 1.1842 },
+        { f: [], ring: 0.3947 },
+        { f: [261.63], ring: 0.3947 },
+        { f: [329.63], ring: 0.3947 },
+        { f: [440], ring: 0.3947 },
+        { f: [493.88], ring: 0.7895 },
+        { f: [], ring: 0.3947 },
+        { f: [329.63], ring: 0.3947 },
+        { f: [523.25], ring: 0.3947 },
+        { f: [493.88], ring: 0.3947 },
+        { f: [440], ring: 1.5789 },
+      ] },
+      { bpm: 150, notes: [
+        { f: [277.18], ring: 0.6000 },
+        { f: [369.99], ring: 0.2000 },
+        { f: [440], ring: 0.6000 },
+        { f: [369.99], ring: 0.2000 },
+        { f: [349.23], ring: 0.6000 },
+        { f: [369.99], ring: 0.1000 },
+        { f: [415.3], ring: 0.1000 },
+        { f: [369.99], ring: 0.8000 },
+        { f: [293.66], ring: 0.6000 },
+        { f: [329.63], ring: 0.1000 },
+        { f: [369.99], ring: 0.1000 },
+        { f: [277.18], ring: 0.8000 },
+        { f: [246.94], ring: 0.1000 },
+        { f: [220], ring: 0.1000 },
+        { f: [220], ring: 0.1000 },
+        { f: [207.65], ring: 0.1000 },
+        { f: [207.65], ring: 0.3000 },
+        { f: [277.18], ring: 0.1000 },
+        { f: [185], ring: 0.8000 },
+        { f: [554.37], ring: 0.6000 },
+        { f: [739.99], ring: 0.1000 },
+        { f: [880], ring: 0.1000 },
+        { f: [1108.73], ring: 0.6000 },
+        { f: [880], ring: 0.2000 },
+        { f: [830.61, 698.46, 587.33], ring: 0.6000 },
+        { f: [880], ring: 0.1000 },
+        { f: [987.77], ring: 0.1000 },
+        { f: [880, 739.99, 554.37], ring: 0.8000 },
+        { f: [587.33], ring: 0.1000 },
+        { f: [659.26], ring: 0.1000 },
+        { f: [739.99], ring: 0.1000 },
+        { f: [587.33], ring: 0.1000 },
+        { f: [554.37], ring: 0.1000 },
+        { f: [587.33], ring: 0.1000 },
+        { f: [659.26], ring: 0.1000 },
+        { f: [554.37], ring: 0.1000 },
+        { f: [493.88], ring: 0.1000 },
+        { f: [554.37], ring: 0.1000 },
+        { f: [587.33], ring: 0.1000 },
+        { f: [493.88], ring: 0.1000 },
+        { f: [440], ring: 0.1000 },
+        { f: [493.88], ring: 0.1000 },
+        { f: [554.37], ring: 0.1000 },
+        { f: [440], ring: 0.1000 },
+        { f: [493.88], ring: 0.1000 },
+        { f: [440], ring: 0.1000 },
+        { f: [440], ring: 0.1000 },
+        { f: [415.3], ring: 0.1000 },
+        { f: [415.3], ring: 0.3000 },
+        { f: [554.37], ring: 0.1000 },
+        { f: [369.99], ring: 0.8000 },
+        { f: [], ring: 0.4000 },
+        { f: [554.37], ring: 0.6000 },
+        { f: [739.99], ring: 0.2000 },
+        { f: [880], ring: 0.6000 },
+        { f: [739.99], ring: 0.2000 },
+        { f: [698.46], ring: 0.6000 },
+        { f: [739.99], ring: 0.1000 },
+        { f: [830.61], ring: 0.1000 },
+        { f: [739.99], ring: 0.8000 },
+        { f: [587.33], ring: 0.6000 },
+        { f: [659.26], ring: 0.1000 },
+        { f: [739.99], ring: 0.1000 },
+        { f: [554.37], ring: 0.8000 },
+        { f: [493.88], ring: 0.1000 },
+        { f: [440], ring: 0.1000 },
+        { f: [440], ring: 0.1000 },
+        { f: [415.3], ring: 0.1000 },
+        { f: [415.3], ring: 0.3000 },
+        { f: [554.37], ring: 0.1000 },
+        { f: [369.99], ring: 0.8000 },
+        { f: [554.37], ring: 0.3000 },
+        { f: [739.99], ring: 0.1000 },
+        { f: [880], ring: 0.1000 },
+        { f: [1108.73], ring: 0.1000 },
+        { f: [1479.98], ring: 0.1000 },
+        { f: [1760], ring: 0.1000 },
+      ] },
+      { bpm: 120, notes: [
+        { f: [493.88], ring: 0.1250 },
+        { f: [440], ring: 0.1250 },
+        { f: [415.3], ring: 0.1250 },
+        { f: [440], ring: 0.1250 },
+        { f: [523.25], ring: 0.2500 },
+        { f: [], ring: 0.2500 },
+        { f: [587.33], ring: 0.1250 },
+        { f: [523.25], ring: 0.1250 },
+        { f: [493.88], ring: 0.1250 },
+        { f: [523.25], ring: 0.1250 },
+        { f: [659.26], ring: 0.2500 },
+        { f: [], ring: 0.2500 },
+        { f: [698.46], ring: 0.1250 },
+        { f: [659.26], ring: 0.1250 },
+        { f: [622.25], ring: 0.1250 },
+        { f: [659.26], ring: 0.1250 },
+        { f: [987.77], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [830.61], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [987.77], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [830.61], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [1046.5], ring: 0.5000 },
+        { f: [880], ring: 0.2500 },
+        { f: [1046.5], ring: 0.2500 },
+        { f: [987.77], ring: 0.2500 },
+        { f: [880], ring: 0.2500 },
+        { f: [783.99], ring: 0.2500 },
+        { f: [880], ring: 0.2500 },
+        { f: [987.77], ring: 0.2500 },
+        { f: [880], ring: 0.2500 },
+        { f: [783.99], ring: 0.2500 },
+        { f: [880], ring: 0.2500 },
+        { f: [987.77], ring: 0.2500 },
+        { f: [880], ring: 0.2500 },
+        { f: [783.99], ring: 0.2500 },
+        { f: [739.99], ring: 0.2500 },
+        { f: [659.26], ring: 0.5000 },
+        { f: [493.88], ring: 0.1250 },
+        { f: [440], ring: 0.1250 },
+        { f: [415.3], ring: 0.1250 },
+        { f: [440], ring: 0.1250 },
+        { f: [523.25], ring: 0.2500 },
+        { f: [], ring: 0.2500 },
+        { f: [587.33], ring: 0.1250 },
+        { f: [523.25], ring: 0.1250 },
+        { f: [493.88], ring: 0.1250 },
+        { f: [523.25], ring: 0.1250 },
+        { f: [659.26], ring: 0.2500 },
+        { f: [], ring: 0.2500 },
+        { f: [698.46], ring: 0.1250 },
+        { f: [659.26], ring: 0.1250 },
+        { f: [622.25], ring: 0.1250 },
+        { f: [659.26], ring: 0.1250 },
+        { f: [987.77], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [830.61], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [987.77], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [830.61], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [1046.5], ring: 0.5000 },
+        { f: [880], ring: 0.2500 },
+        { f: [1046.5], ring: 0.2500 },
+        { f: [987.77], ring: 0.2500 },
+        { f: [880], ring: 0.2500 },
+        { f: [783.99], ring: 0.2500 },
+        { f: [880], ring: 0.2500 },
+        { f: [987.77], ring: 0.2500 },
+        { f: [880], ring: 0.2500 },
+        { f: [783.99], ring: 0.2500 },
+        { f: [880], ring: 0.2500 },
+        { f: [987.77], ring: 0.2500 },
+        { f: [880], ring: 0.2500 },
+        { f: [783.99], ring: 0.2500 },
+        { f: [739.99], ring: 0.2500 },
+        { f: [659.26], ring: 0.5000 },
+        { f: [493.88], ring: 0.1250 },
+        { f: [440], ring: 0.1250 },
+        { f: [415.3], ring: 0.1250 },
+        { f: [440], ring: 0.1250 },
+        { f: [523.25], ring: 0.2500 },
+        { f: [], ring: 0.2500 },
+        { f: [587.33], ring: 0.1250 },
+        { f: [523.25], ring: 0.1250 },
+        { f: [493.88], ring: 0.1250 },
+        { f: [523.25], ring: 0.1250 },
+        { f: [659.26], ring: 0.2500 },
+        { f: [], ring: 0.2500 },
+        { f: [698.46], ring: 0.1250 },
+        { f: [659.26], ring: 0.1250 },
+        { f: [622.25], ring: 0.1250 },
+        { f: [659.26], ring: 0.1250 },
+        { f: [987.77], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [830.61], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [987.77], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [830.61], ring: 0.1250 },
+        { f: [880], ring: 0.1250 },
+        { f: [1046.5], ring: 0.5000 },
+      ] },
+      { bpm: 72, notes: [
+        { f: [466.16], ring: 0.4167 },
+        { f: [783.99], ring: 1.6667 },
+        { f: [698.46], ring: 0.4167 },
+        { f: [783.99], ring: 0.4167 },
+        { f: [698.46], ring: 1.2500 },
+        { f: [622.25], ring: 0.8333 },
+        { f: [466.16], ring: 0.4167 },
+        { f: [783.99], ring: 0.8333 },
+        { f: [523.25], ring: 0.0694 },
+        { f: [554.37], ring: 0.0694 },
+        { f: [523.25], ring: 0.0694 },
+        { f: [493.88], ring: 0.0694 },
+        { f: [523.25], ring: 0.1389 },
+        { f: [1046.5], ring: 0.8333 },
+        { f: [783.99], ring: 0.4167 },
+        { f: [932.33], ring: 1.2500 },
+        { f: [830.61], ring: 0.8333 },
+        { f: [783.99], ring: 0.4167 },
+        { f: [698.46], ring: 1.2500 },
+        { f: [783.99], ring: 0.8333 },
+        { f: [587.33], ring: 0.4167 },
+        { f: [622.25], ring: 1.2500 },
+        { f: [523.25], ring: 1.2500 },
+        { f: [466.16], ring: 0.4167 },
+        { f: [1174.66], ring: 0.4167 },
+        { f: [1046.5], ring: 0.4167 },
+        { f: [932.33], ring: 0.2083 },
+        { f: [830.61], ring: 0.2083 },
+        { f: [783.99], ring: 0.2083 },
+        { f: [830.61], ring: 0.2083 },
+        { f: [523.25], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [622.25], ring: 1.2500 },
+        { f: [], ring: 0.8333 },
+      ] },
+      { bpm: 72, notes: [
+        { f: [783.99], ring: 0.2083 },
+        { f: [783.99], ring: 0.2083 },
+        { f: [880], ring: 0.2083 },
+        { f: [880], ring: 0.2083 },
+        { f: [932.33], ring: 0.2083 },
+        { f: [932.33], ring: 0.2083 },
+        { f: [880], ring: 0.2083 },
+        { f: [880], ring: 0.2083 },
+        { f: [783.99], ring: 0.2083 },
+        { f: [783.99], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [466.16], ring: 0.2083 },
+        { f: [466.16], ring: 0.2083 },
+        { f: [392], ring: 0.2083 },
+        { f: [392], ring: 0.2083 },
+        { f: [698.46], ring: 0.2083 },
+        { f: [698.46], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [698.46], ring: 0.2083 },
+        { f: [622.25], ring: 0.4167 },
+        { f: [], ring: 0.4167 },
+        { f: [], ring: 0.4167 },
+        { f: [], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [698.46], ring: 0.2083 },
+        { f: [698.46], ring: 0.2083 },
+        { f: [783.99], ring: 0.2083 },
+        { f: [783.99], ring: 0.2083 },
+        { f: [880], ring: 0.2083 },
+        { f: [880], ring: 0.2083 },
+        { f: [698.46], ring: 0.2083 },
+        { f: [698.46], ring: 0.2083 },
+        { f: [523.25], ring: 0.2083 },
+        { f: [523.25], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [523.25], ring: 0.2083 },
+        { f: [523.25], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [587.33], ring: 0.4167 },
+        { f: [1174.66], ring: 0.1042 },
+        { f: [2349.32], ring: 0.7292 },
+        { f: [587.33], ring: 0.4167 },
+        { f: [392], ring: 0.2083 },
+        { f: [466.16], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [523.25], ring: 0.2083 },
+        { f: [587.33], ring: 0.4167 },
+        { f: [392], ring: 0.2083 },
+        { f: [466.16], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [523.25], ring: 0.2083 },
+        { f: [587.33], ring: 0.4167 },
+        { f: [392], ring: 0.2083 },
+        { f: [466.16], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [622.25], ring: 0.4167 },
+        { f: [392], ring: 0.2083 },
+        { f: [466.16], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [622.25], ring: 0.4167 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [587.33], ring: 0.2083 },
+        { f: [622.25], ring: 0.2083 },
+        { f: [659.26], ring: 0.2083 },
+        { f: [698.46], ring: 0.4167 },
+        { f: [698.46], ring: 0.2083 },
+        { f: [783.99], ring: 0.2083 },
+        { f: [698.46], ring: 0.2083 },
+        { f: [783.99], ring: 0.2083 },
+        { f: [587.33], ring: 0.4167 },
+        { f: [], ring: 0.4167 },
+        { f: [], ring: 0.4167 },
+      ] },
+    ]);
 
     const MESSAGES = {
       zh: {
@@ -308,6 +690,8 @@ window.__ModuleLoader__.load({
      *
      * 注意方向：这是「**快速甩动静音**」的门槛（防止飞速划过时音符连成一片），
      * 不是「慢速静音」。v0.2.4 曾把它写反，v0.2.5 按原文更正。
+     * v0.2.6 起裁决改为三态：慢速 'pass'（正常单音）、起步窗口 'mute'（静音，原文）、
+     * 快速 'strum'（mimo 本体静音；本项目增强 —— 改派单频刮弦音，见 playMimoStrum）。
      * 只有「光标划过」（pointermove）带手势上下文；点击 / 键盘 / 滚轮 / 试听不判
      * （原文 hit 路径也不经过 Ve）。
      */
@@ -320,29 +704,37 @@ window.__ModuleLoader__.load({
       let samples = [];
 
       return {
-        /** gesture: { x, y } 本次划过位置；at: 事件时间戳（ms）。 */
+        /**
+         * gesture: { x, y } 本次划过位置；at: 事件时间戳（ms）。
+         * 返回三态裁决（v0.2.6）：
+         *   'mute'  —— 原文 Ve=false 的「进入导轨不足 100ms」：静音；
+         *   'strum' —— 原文 Ve=false 的「窗口内速度 ≥600px/s」：mimo 本体静音，
+         *              本项目增强改播单频刮弦音（见 playMimoStrum）；
+         *   'pass'  —— 原文 Ve=true（含单帧）：正常播位置单音。
+         */
         allow(gesture, at) {
           // 没有可用的手势数据时不做速度判定（调用方只在 hover 路径传）
-          if (gesture === null || typeof gesture !== 'object') return true;
-          if (typeof at !== 'number' || !Number.isFinite(at)) return true;
+          if (gesture === null || typeof gesture !== 'object') return 'pass';
+          if (typeof at !== 'number' || !Number.isFinite(at)) return 'pass';
           const x = Number(gesture.x);
           const y = Number(gesture.y);
-          if (!Number.isFinite(x) || !Number.isFinite(y)) return true;
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return 'pass';
           // qe：首次采样即记 entryAt（原文 e.entryAt == null && (e.entryAt = l)）
           if (entryAt === null) entryAt = at;
           samples.push({ x, y, t: at });
           // qe：丢弃早于窗口的样本（原文 while samples[0].t < t - He）
           while (samples.length > 0 && at - samples[0].t > windowMs) samples.shift();
           // Ve：进入导轨不足 100ms 静音
-          if (at - entryAt < entryMs) return false;
+          if (at - entryAt < entryMs) return 'mute';
           // Ve：样本不足两帧直接放行
-          if (samples.length < 2) return true;
+          if (samples.length < 2) return 'pass';
           const first = samples[0];
           const latest = samples[samples.length - 1];
           const elapsed = latest.t - first.t;
-          if (elapsed <= 0) return true; // 原文 p <= 0 ⇒ true
+          if (elapsed <= 0) return 'pass'; // 原文 p <= 0 ⇒ true
           const speed = (Math.hypot(latest.x - first.x, latest.y - first.y) / elapsed) * 1000;
-          return speed < maxSpeed; // 慢速放行、快速甩动静音
+          // 原文：慢速放行、快速静音。本项目把「快速」改派为单频刮弦音。
+          return speed < maxSpeed ? 'pass' : 'strum';
         },
         /** fe：离开导轨（或 blur）后复位：下一段手势重新计时。 */
         reset() {
@@ -352,6 +744,83 @@ window.__ModuleLoader__.load({
         /** 诊断用：当前取样窗口内的样本数与进入时刻。 */
         stats() {
           return { entryAt, samples: samples.length };
+        },
+      };
+    }
+
+    /**
+     * 彩蛋状态机（v0.2.6，逐字移植原文 R/x/Y/k/j 与 S/U/V）：
+     *   原文 hover 入口：`if(R){X(!1);return}` —— 激活期间每次手势推进一个音（弱音）；
+     *                  `if(!k&&(k=!0, now-j>=V && random()<S)){随机选曲; X(!1); return}` ——
+     *                  每轮互动只掷一次骰子（离开导轨时 endEngagement 复位 k）；
+     *   原文 hit：激活 → `i(R[x].freqs,!0,R[x].ring)`（强音推进），否则正常强音单频。
+     *   X()：`i(m.freqs,d,m.ring); x+=1; x>=len → x=0,Y+=1; Y>=U(1) → 结束, j=now`。
+     *   resetEgg（卸载）：若还在播 → j=now（冷却从打断处重新起算）。
+     * attempt() 返回 null 表示「本次不播彩蛋、按常规单音走」。
+     */
+    function createMimoEgg(options) {
+      const settings = options === null || typeof options !== 'object' ? {} : options;
+      const now = typeof settings.now === 'function' ? settings.now : () => Date.now();
+      const random = typeof settings.random === 'function' ? settings.random : () => Math.random();
+      const cooldownMs = typeof settings.cooldownMs === 'number' ? settings.cooldownMs : MIMO_EGG_COOLDOWN_MS;
+      let songIndex = null;
+      let noteIndex = 0;
+      let loops = 0;
+      let rolled = false; // 原文 k：本轮互动已掷过骰子
+      // 原文 j=0（配合浏览器里的巨大 epoch 时间戳，首掷必过冷却）。本项目用「相对时刻」
+      // （测试可注入 now），等价语义 = 初始即已冷却完毕。
+      let lastFinishedAt = Number.NEGATIVE_INFINITY; // 原文 j：上次彩蛋结束（或被打断）的时刻
+
+      return {
+        /** { strong, roll } → { freqs, ring, strong } | null */
+        attempt(gesture) {
+          const request = gesture === null || typeof gesture !== 'object' ? {} : gesture;
+          if (songIndex === null) {
+            // 原文掷骰只发生在 hover 路径，且每轮互动只掷一次（k 先置真再判冷却与概率）。
+            if (request.roll === true && rolled !== true) {
+              rolled = true;
+              if (now() - lastFinishedAt >= cooldownMs && random() < MIMO_EGG_PROBABILITY) {
+                songIndex = Math.floor(random() * MIMO_EGG_SONGS.length);
+                noteIndex = 0;
+                loops = 0;
+              }
+            }
+            if (songIndex === null) return null;
+          }
+          const song = MIMO_EGG_SONGS[songIndex];
+          const note = song.notes[noteIndex];
+          noteIndex += 1;
+          if (noteIndex >= song.notes.length) {
+            noteIndex = 0;
+            loops += 1;
+            if (loops >= MIMO_EGG_LOOPS) {
+              songIndex = null;
+              lastFinishedAt = now();
+            }
+          }
+          return { freqs: note.f, ring: note.ring, strong: request.strong === true };
+        },
+        /** 离开导轨（原文 endEngagement）：只复位掷骰资格，不打断进行中的曲子。 */
+        endEngagement() {
+          rolled = false;
+        },
+        /** 卸载（原文 resetEgg）：打断则冷却从现在重算，并清空全部状态。 */
+        reset() {
+          if (songIndex !== null) lastFinishedAt = now();
+          songIndex = null;
+          noteIndex = 0;
+          loops = 0;
+          rolled = false;
+        },
+        stats() {
+          return {
+            active: songIndex !== null,
+            songIndex,
+            noteIndex,
+            loops,
+            rolled,
+            lastFinishedAt,
+          };
         },
       };
     }
@@ -422,8 +891,12 @@ window.__ModuleLoader__.load({
         if (hz === null) return false;
         // 滑动速度门槛（mimo 音色）：只作用于「光标划过」（gesture.hover）——
         // 点击 / 键盘 / 滚轮 / 试听照常发声（原文 hit 路径也不走 Ve）。
+        // v0.2.6 三态：'mute' 静音；'strum' 快速甩动（mimo 本体静音，本项目改播刮弦音）；
+        // 'pass' 正常。裁决随 meta.gate 交给音色分发。
+        let verdict = null;
         if (gate !== null && gesture !== null && gesture !== undefined && gesture.hover === true) {
-          if (gate(gesture, at) !== true) return false;
+          verdict = gate(gesture, at);
+          if (verdict === 'mute') return false;
         }
         lastAt = at;
         lastDegree = key;
@@ -437,6 +910,7 @@ window.__ModuleLoader__.load({
             strong: repeat === true,
             source: typeof source === 'string' ? source : 'rail',
             tick: tickIndex,
+            gate: verdict,
           });
         }
         return true;
@@ -666,6 +1140,72 @@ window.__ModuleLoader__.load({
 
 
     /**
+     * 刮弦合成器（v0.2.6）：逐字移植原文 `i(freqs, strong, ring)` ——
+     * 每个频率叠 5 个分音（基频三角波 + 2/3/4/6 次正弦泛音，增益 [1,.42,.22,.12,.06]），
+     * 并联进一条 master gain，再串 lowpass（4200Hz 在 0.85F 处指数扫到 1400Hz）。
+     * master 峰值按 √len 归一（mimo 的 (m?.3:.13)/Math.sqrt(d.length)）→ 多音同响不削波；
+     * 总时长 F = clamp(0.25 + ring, 0.4, 2.6)；停振 F+0.05s。
+     * 休止（freqs 为空）与原文一样早退：不建节点、但手势已消耗（返回 true）。
+     */
+    function playMimoStrum(audio, freqs, volume, strong, ring) {
+      if (Array.isArray(freqs) === false || freqs.length === 0) return true;
+      const start = audio.currentTime;
+      const duration = Math.min(MIMO_STRUM_MAX_S, Math.max(MIMO_STRUM_MIN_S, MIMO_STRUM_BASE_S + ring));
+      const master = audio.createGain();
+      master.gain.setValueAtTime(0.0001, start);
+      master.gain.exponentialRampToValueAtTime(
+        (volume * (strong ? MIMO_HIT_GAIN : MIMO_HOVER_GAIN)) / Math.sqrt(freqs.length),
+        start + MIMO_STRUM_ATTACK_S,
+      );
+      master.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+      const filter = audio.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(MIMO_STRUM_FILTER_FROM_HZ, start);
+      filter.frequency.exponentialRampToValueAtTime(
+        MIMO_STRUM_FILTER_TO_HZ,
+        start + duration * MIMO_STRUM_FILTER_SPAN,
+      );
+      master.connect(filter);
+      filter.connect(audio.destination);
+      const voices = [];
+      for (const freq of freqs) {
+        for (let partial = 0; partial < MIMO_STRUM_PARTIALS.length; partial += 1) {
+          const spec = MIMO_STRUM_PARTIALS[partial];
+          const oscillator = audio.createOscillator();
+          const gain = audio.createGain();
+          oscillator.type = spec[2];
+          oscillator.frequency.setValueAtTime(freq * spec[0], start);
+          if (partial === 0) {
+            oscillator.detune.setValueAtTime(MIMO_STRUM_DETUNE_CENTS, start); // 原文 se===0
+          }
+          gain.gain.setValueAtTime(spec[1], start);
+          oscillator.connect(gain);
+          gain.connect(master);
+          oscillator.start(start);
+          oscillator.stop(start + duration + MIMO_STOP_PAD_S);
+          voices.push({ oscillator, gain });
+        }
+      }
+      voices[0].oscillator.onended = () => {
+        for (const voice of voices) {
+          try {
+            voice.oscillator.disconnect();
+            voice.gain.disconnect();
+          } catch (error) {
+            /* 已断开 */
+          }
+        }
+        try {
+          master.disconnect();
+          filter.disconnect();
+        } catch (error) {
+          /* 已断开 */
+        }
+      };
+      return true;
+    }
+
+    /**
      * mimo 音色（v0.2.5）：逐行移植原文 `p(freq, strong)` ——
      * 单个 triangle 振荡器，1e-4 起步、8ms 指数升到峰值、再指数衰减回 1e-4，
      * 峰值与时长按两档（强音 0.3 / 0.9s、弱音 0.13 / 0.42s），停振各留 0.05s。
@@ -673,8 +1213,22 @@ window.__ModuleLoader__.load({
      * 强音档由 meta.strong（明确手势：点击刻度 / 键盘激活 / 试听）触发 ——
      * 对应原文的 hit 路径 `p(s(d,m), !0)`；hover 路径传 `!1` 走弱音。
      * 峰值就是原文的绝对增益（0.13 / 0.3），再乘本项目音量：音量 100% = 与 mimo 等响。
+     *
+     * v0.2.6 分发：meta.strum = { freqs, ring, strong } 时改播刮弦音 ——
+     * 来源有两条：① 快速滑动（本项目增强，strong=false 对应原文 hover 的弱音档）；
+     * ② 彩蛋激活期间（freqs/ring 来自曲库当前音，strong 按 hover/hit 路径）。
      */
     function playMimo(audio, hz, volume, meta) {
+      if (meta !== null && meta !== undefined && meta.strum !== null && meta.strum !== undefined) {
+        const strum = meta.strum;
+        return playMimoStrum(
+          audio,
+          strum.freqs,
+          volume,
+          strum.strong === true,
+          typeof strum.ring === 'number' && Number.isFinite(strum.ring) ? strum.ring : MIMO_STRUM_DEFAULT_RING,
+        );
+      }
       const start = audio.currentTime;
       const strong = meta !== null && meta !== undefined && meta.strong === true;
       const peak = volume * (strong ? MIMO_HIT_GAIN : MIMO_HOVER_GAIN);
@@ -977,8 +1531,9 @@ window.__ModuleLoader__.load({
     /**
      * 全局委托监听（捕获阶段 + passive）：
      * 不缓存刻度节点（虚拟滚动会回收），不阻止任何默认行为。
-     * env: { view, arm(), signal(position, source, tick, options, gesture), gate? }
+     * env: { view, arm(), signal(position, source, tick, options, gesture), gate?, egg?, keyFor? }
      *   gesture = { x, y }（只有 pointermove 带；点击 / 滚轮 / 试听没有 → 不判滑动速度）
+     *   egg.endEngagement()：离开导轨满延迟确认后复位彩蛋的「本轮掷骰资格」（mimo 原文 k）
      */
     function attachRailListeners(env) {
       const view = env.view;
@@ -1015,6 +1570,11 @@ window.__ModuleLoader__.load({
         lastReset = { reason: typeof reason === 'string' ? reason : 'unknown', at: Date.now() };
         // 滑动速度门槛的采样也一并复位：真离开再划回来算一段新手势（mimo 的 fe() 同义）。
         if (env.gate !== null && env.gate !== undefined && typeof env.gate.reset === 'function') env.gate.reset();
+        // 彩蛋的「掷骰资格」同样按互动周期计（原文 endEngagement）：
+        // 离开导轨后下一次进入重新掷一次 5%；进行中的曲子**不打断**（原文 k 只影响掷骰）。
+        if (env.egg !== null && env.egg !== undefined && typeof env.egg.endEngagement === 'function') {
+          env.egg.endEngagement();
+        }
       }
 
       function cancelOffRailReset() {
@@ -1785,19 +2345,52 @@ window.__ModuleLoader__.load({
         const recent = [];
         // 滑动速度门槛（mimo 复刻音色）：按当前音色开/关采样，并交给监听层复位。
         const mimoGate = createMimoGate({});
+        // 彩蛋状态机（mimo 音色专用）：hover 掷骰（5%/180s），激活期间手势逐音推进旋律。
+        const mimoEgg = createMimoEgg({});
         const controller = createController({
           // 音高：该音色自带 pitchAt（mimo = 刻度下标/刻度总数）就用它；
           // 没有自带映射的音色保持「位置→音级→noteHz」的既有行为（返回 null）。
           pitchAt: (context) => resolvePitch(pitchForVoice(state.get().voice), context),
           // 去重粒度：mimo 按刻度下标、其它音色按音级（与监听层注入同一个函数）。
           keyFor: (degree, tick) => dedupKeyFor(state.get().voice, degree, tick),
-          // 门槛只在 mimo 音色下生效：其它音色的划过行为一个字都没变。
-          gate: (gesture, at) => (state.get().voice === 'mimo' ? mimoGate.allow(gesture, at) : true),
+          // 门槛只在 mimo 音色下生效（三态 'mute'/'strum'/'pass'）：其它音色的划过一个字都没变。
+          gate: (gesture, at) => (state.get().voice === 'mimo' ? mimoGate.allow(gesture, at) : 'pass'),
           play: (hz, meta) => {
             lastTick = meta !== null && meta !== undefined && meta.tick !== null ? meta.tick : null;
+            // mimo 分发（原文语义）：
+            //   - 划过被门槛放行（'pass' / 非划过来源）→ 问彩蛋：命中或激活则改播旋律音；
+            //   - 快速划过（'strum'，mimo 本体静音）→ 不掷骰也不推进（原文此时根本不调 hover），
+            //     本项目增强：播单频刮弦音；
+            //   - 其余 → 常规单音。
+            let eggNote = null;
+            let fastStrum = false;
+            if (meta !== null && meta !== undefined && state.get().voice === 'mimo') {
+              if (meta.source === 'hover' && meta.gate === 'strum') {
+                fastStrum = true;
+              } else {
+                try {
+                  eggNote = mimoEgg.attempt({
+                    strong: meta.strong === true,
+                    roll: meta.source === 'hover',
+                  });
+                } catch (error) {
+                  eggNote = null;
+                }
+              }
+            }
+            let dispatch = meta;
+            if (eggNote !== null || fastStrum) {
+              dispatch = {
+                ...meta,
+                strum:
+                  eggNote !== null
+                    ? eggNote
+                    : { freqs: [hz], ring: MIMO_STRUM_DEFAULT_RING, strong: false },
+              };
+            }
             let played = false;
             try {
-              played = engine.play(hz, meta);
+              played = engine.play(hz, dispatch);
             } catch (error) {
               played = false;
             }
@@ -1809,6 +2402,8 @@ window.__ModuleLoader__.load({
               tick: lastTick,
               degree: meta === null || meta === undefined ? null : meta.degree,
               played: played === true,
+              egg: eggNote !== null,
+              strum: eggNote !== null || fastStrum,
             });
             if (recent.length > 20) recent.shift();
           },
@@ -1843,6 +2438,12 @@ window.__ModuleLoader__.load({
             runtime.listeners = null;
           }
           engine.dispose();
+          // 卸载（原文组件 unmount → z.resetEgg()）：打断中的彩蛋把冷却起点推到当下。
+          try {
+            mimoEgg.reset();
+          } catch (error) {
+            /* 忽略 */
+          }
           try {
             instances.count = Math.max(0, instances.count - 1);
           } catch (error) {
@@ -1872,6 +2473,7 @@ window.__ModuleLoader__.load({
             view,
             arm: () => engine.arm(),
             gate: mimoGate,
+            egg: mimoEgg,
             // 去重粒度与控制器一致（mimo = 刻度下标）；监听层若不注入，会在
             // 控制器之前按 10 档音级把相邻刻度拦掉，mimo 音色就听不出音阶。
             keyFor: (degree, tick) => dedupKeyFor(state.get().voice, degree, tick),
@@ -2025,6 +2627,7 @@ window.__ModuleLoader__.load({
               railSeen: runtime.listeners === null ? false : runtime.listeners.railSeen(),
               audioState: engine.state(),
               dedup: listenerStats,
+              egg: mimoEgg.stats(),
               settingsFailure,
               settings:
                 settings === null || settings === undefined
@@ -2148,6 +2751,22 @@ window.__ModuleLoader__.load({
         MIMO_GATE_ENTRY_MS,
         MIMO_GATE_WINDOW_MS,
         MIMO_GATE_MAX_SPEED,
+        MIMO_STRUM_BASE_S,
+        MIMO_STRUM_MIN_S,
+        MIMO_STRUM_MAX_S,
+        MIMO_STRUM_ATTACK_S,
+        MIMO_STRUM_FILTER_FROM_HZ,
+        MIMO_STRUM_FILTER_TO_HZ,
+        MIMO_STRUM_FILTER_SPAN,
+        MIMO_STRUM_DETUNE_CENTS,
+        MIMO_STRUM_DEFAULT_RING,
+        MIMO_STRUM_PARTIALS,
+        MIMO_EGG_PROBABILITY,
+        MIMO_EGG_COOLDOWN_MS,
+        MIMO_EGG_LOOPS,
+        MIMO_EGG_SONGS,
+        playMimoStrum,
+        createMimoEgg,
         ATTACK_S,
         normalizeVoice,
         synthForVoice,
