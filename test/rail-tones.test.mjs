@@ -814,11 +814,29 @@ test('mimo 滑动速度门槛：逐字移植原文 Le/qe/Ve/fe（慢速放行、
   assert.equal(createMimoGate({}).allow({ x: Number.NaN, y: 0 }, 0), 'pass');
 });
 
-test('音频引擎：mimo 音色 = 三角波 + 原文双档包络与绝对增益', async () => {
-  const { createEngine, VOICES, MIMO_HOVER_GAIN, MIMO_HIT_GAIN, MIMO_ATTACK_S, MIMO_DECAY_S, MIMO_HIT_DECAY_S, MIMO_STOP_PAD_S } =
-    (await loaded).internals;
-  assert.equal(MIMO_HOVER_GAIN, 0.13, '原文 hover 绝对增益');
-  assert.equal(MIMO_HIT_GAIN, 0.3, '原文 hit 绝对增益');
+test('音频引擎：mimo 音色 = 三角波 + 双档包络，响度对齐其它音色', async () => {
+  const {
+    createEngine,
+    VOICES,
+    PEAK_FACTOR,
+    MIMO_HOVER_GAIN,
+    MIMO_HIT_GAIN,
+    MIMO_HOVER_PEAK,
+    MIMO_HIT_PEAK,
+    MIMO_ATTACK_S,
+    MIMO_DECAY_S,
+    MIMO_HIT_DECAY_S,
+    MIMO_STOP_PAD_S,
+  } = (await loaded).internals;
+  // 原文绝对增益只作记录（v0.2.7 起不再直接使用）。
+  assert.equal(MIMO_HOVER_GAIN, 0.13, '原文 hover 绝对增益（记录值）');
+  assert.equal(MIMO_HIT_GAIN, 0.3, '原文 hit 绝对增益（记录值）');
+  // 生效峰值：强音档与 sine 等峰、弱音档取其 7 成 —— 对齐其它音色响度。
+  assert.equal(MIMO_HIT_PEAK, PEAK_FACTOR, '强音档 = PEAK_FACTOR（与 sine 100% 等峰）');
+  assert.equal(MIMO_HOVER_PEAK, 0.6, '弱音档 ≈ 其它音色满音量峰值的 7 成');
+  assert.ok(MIMO_HIT_PEAK > MIMO_HOVER_PEAK, '点击强音档仍应响于划过弱音档');
+  assert.ok(MIMO_HOVER_PEAK > MIMO_HOVER_GAIN && MIMO_HIT_PEAK > MIMO_HIT_GAIN, '响度对齐 = 两档都抬于原文裸值');
+  assert.ok(MIMO_HIT_PEAK < 1 && MIMO_HOVER_PEAK < 1, '两档满音量都在满幅之内（不削波）');
 
   const build = (volume) => {
     const { context, nodes } = fakeAudio();
@@ -830,14 +848,14 @@ test('音频引擎：mimo 音色 = 三角波 + 原文双档包络与绝对增益
     return { engine, context, nodes };
   };
 
-  // hover（划过，原文 `p(s(d,m), !1)`）：三角波、8ms 指数升到 0.13、0.42s 衰减、+0.05s 停振。
+  // hover（划过，原文 `p(s(d,m), !1)`）：三角波、8ms 指数升到弱音档峰值、0.42s 衰减、+0.05s 停振。
   const hover = build(1);
   assert.equal(hover.engine.play(261.63, { source: 'hover', strong: false }), true);
   assert.equal(hover.nodes.oscillators.length, 1, 'mimo 音恰 1 个振荡器');
   assert.equal(hover.nodes.oscillators[0].type, 'triangle', '必须是三角波（3 次谐波 ≈ −19dB 的亮泛音来源）');
   assert.equal(hover.nodes.oscillators[0].hz, 261.63);
   const hoverValues = hover.nodes.gains[0].gain.values;
-  assert.deepEqual(hoverValues, [0.0001, MIMO_HOVER_GAIN, 0.0001], '包络：1e-4 → 0.13 → 1e-4');
+  assert.deepEqual(hoverValues, [0.0001, MIMO_HOVER_PEAK, 0.0001], '包络：1e-4 → 弱音档峰值 → 1e-4');
   assert.equal(MIMO_ATTACK_S, 0.008, '原文 h+.008');
   assert.equal(MIMO_DECAY_S, 0.42, '原文 hover 衰减');
   assert.ok(
@@ -845,29 +863,28 @@ test('音频引擎：mimo 音色 = 三角波 + 原文双档包络与绝对增益
     '停振点 = 衰减 + 0.05s（原文 .46）',
   );
 
-  // 强音档（点击刻度 / 键盘激活 / 试听，原文 `p(s(d,m), !0)`）：0.3 / 0.9s。
+  // 强音档（点击刻度 / 键盘激活 / 试听，原文 `p(s(d,m), !0)`）：峰值 PEAK_FACTOR、衰减 0.9s。
   const click = build(1);
   assert.equal(click.engine.play(261.63, { source: 'click', strong: true }), true);
   const clickValues = click.nodes.gains[0].gain.values;
-  assert.deepEqual(clickValues, [0.0001, MIMO_HIT_GAIN, 0.0001], '点击 = 强音档 0.3');
+  assert.deepEqual(clickValues, [0.0001, MIMO_HIT_PEAK, 0.0001], '点击 = 强音档 PEAK_FACTOR');
   assert.equal(MIMO_HIT_DECAY_S, 0.9, '原文 hit 衰减');
   assert.ok(
     Math.abs(click.nodes.oscillators[0].stopAt - (1.5 + MIMO_HIT_DECAY_S + MIMO_STOP_PAD_S)) < 1e-9,
     '强音停振 = 0.95s',
   );
-  // 强音必须比弱音响（原文两档差 ≈ 7.3dB）。
+  // 强音必须比弱音响。
   assert.ok(clickValues[1] > hoverValues[1], '点击强音应明显响于划过');
 
   // 没有 strong 标记（如滚轮 / 拖拽）→ 弱音档。
   const plain = build(1);
   plain.engine.play(261.63, { source: 'wheel' });
-  assert.ok(Math.abs(plain.nodes.gains[0].gain.values[1] - MIMO_HOVER_GAIN) < 1e-12, '滚轮走弱音档');
+  assert.ok(Math.abs(plain.nodes.gains[0].gain.values[1] - MIMO_HOVER_PEAK) < 1e-12, '滚轮走弱音档');
 
-  // 音量线性缩放（100% = 与 mimo 等响）；音量 0 静音；两档都在满幅内。
+  // 音量线性缩放；音量 0 静音。
   const half = build(0.5);
   half.engine.play(261.63, { source: 'hover', strong: false });
-  assert.ok(Math.abs(half.nodes.gains[0].gain.values[1] - MIMO_HOVER_GAIN * 0.5) < 1e-12, '峰值随音量线性缩放');
-  assert.ok(MIMO_HIT_GAIN < 1 && MIMO_HOVER_GAIN < 1, '两档满音量都在满幅之内');
+  assert.ok(Math.abs(half.nodes.gains[0].gain.values[1] - MIMO_HOVER_PEAK * 0.5) < 1e-12, '峰值随音量线性缩放');
   const zero = build(0);
   assert.equal(zero.engine.play(261.63, { source: 'hover' }), false);
   assert.equal(zero.nodes.oscillators.length, 0, '音量为 0 不建节点');
@@ -1217,8 +1234,8 @@ test('音频引擎：mimo 刮弦音 = 5 分音 × 频率 + lowpass 扫频，峰�
   const {
     createEngine,
     VOICES,
-    MIMO_HOVER_GAIN,
-    MIMO_HIT_GAIN,
+    MIMO_HOVER_PEAK,
+    MIMO_HIT_PEAK,
     MIMO_STRUM_BASE_S,
     MIMO_STRUM_MIN_S,
     MIMO_STRUM_MAX_S,
@@ -1266,7 +1283,7 @@ test('音频引擎：mimo 刮弦音 = 5 分音 × 频率 + lowpass 扫频，峰�
   const duration = MIMO_STRUM_BASE_S + 1.1;
   const master = one.nodes.gains[0];
   assert.equal(master.gain.values.length, 3, 'master：1e-4 → 峰值 → 1e-4');
-  assert.ok(Math.abs(master.gain.values[1] - MIMO_HOVER_GAIN) < 1e-12, '弱音档峰值（单频 √1 不衰减）');
+  assert.ok(Math.abs(master.gain.values[1] - MIMO_HOVER_PEAK) < 1e-12, '弱音档峰值（单频 √1 不衰减）');
   assert.ok(
     Math.abs(one.nodes.oscillators[0].stopAt - (1.5 + duration + MIMO_STOP_PAD_S)) < 1e-9,
     '停振 = F + 0.05',
@@ -1283,7 +1300,7 @@ test('音频引擎：mimo 刮弦音 = 5 分音 × 频率 + lowpass 扫频，峰�
   two.engine.play(440, { strum: { freqs: [440, 550], ring: 0.4, strong: true } });
   assert.equal(two.nodes.oscillators.length, MIMO_STRUM_PARTIALS.length * 2, '两频 = 10 个振荡器');
   assert.ok(
-    Math.abs(two.nodes.gains[0].gain.values[1] - MIMO_HIT_GAIN / Math.SQRT2) < 1e-12,
+    Math.abs(two.nodes.gains[0].gain.values[1] - MIMO_HIT_PEAK / Math.SQRT2) < 1e-12,
     '强音档峰值 ÷ √len',
   );
 

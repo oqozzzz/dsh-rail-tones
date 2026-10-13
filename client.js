@@ -19,7 +19,7 @@
 window.__ModuleLoader__.load({
   id: 'dsh-rail-tones',
   factory(require) {
-    const VERSION = '0.2.6';
+    const VERSION = '0.2.7';
 
     /* ------------------------------------------------------------------ *
      * 常量                                                                *
@@ -112,8 +112,8 @@ window.__ModuleLoader__.load({
     //   ② Ve 的方向是「**慢**于 600px/s 才放行」，快速甩动静音；进入导轨 <100ms 也静音。
     //   ③ hit（点击）走**强音**档 0.3 / 0.9s；只有 hover 走弱音档 0.13 / 0.42s。
     //      （原文 hit 里的 H() 分支恒假，但 p(s(d,m),!0) 这条正常路径是活的。）
-    //   ④ 峰值就是原文的绝对增益 0.13 / 0.3（mimo 本体没有音量概念；本项目音量
-    //      100% = 与 mimo 等响，50% = 一半）。
+    //   ④ 衰减时长 0.42 / 0.9s（原文绝对增益 0.13/0.3 只作记录；本项目音量下的生效
+    //      峰值见 MIMO_HOVER_PEAK / MIMO_HIT_PEAK —— v0.2.7 起对齐其它音色响度）。
     //   ⑤ 去重粒度是**刻度下标**（原文 `c!==w.current`），不是本项目的 10 档音级。
     const MIMO_NOTES = Object.freeze([261.63, 293.66, 329.63, 392, 440]); // C4 D4 E4 G4 A4
     const MIMO_STEPS = MIMO_NOTES.length * 3.6; // 18：mimo 的 r.length*3.6
@@ -121,8 +121,14 @@ window.__ModuleLoader__.load({
     const MIMO_DECAY_S = 0.42; // hover 档衰减（原文 m?.9:.42）
     const MIMO_HIT_DECAY_S = 0.9; // 强音档衰减
     const MIMO_STOP_PAD_S = 0.05; // 停振余量（原文 .95/.46 对 .9/.42）
-    const MIMO_HOVER_GAIN = 0.13; // hover 档峰值（原文绝对增益）
-    const MIMO_HIT_GAIN = 0.3; // 强音档峰值（原文绝对增益）
+    const MIMO_HOVER_GAIN = 0.13; // 原文 hover 档绝对增益（仅作记录，v0.2.7 起不再直接使用）
+    const MIMO_HIT_GAIN = 0.3; // 原文强音档绝对增益（仅作记录，同上）
+    // 响度适配（v0.2.7）：原文这两个绝对增益是 mimo「无音量概念」下的裸值，比本项目其它
+    // 音色（sine 0.88 / piano 0.70 / chime 0.79 满音量峰值）轻约 7~13dB，切过来会明显偏小。
+    // 生效峰值改按本项目音量约定对齐：强音档与 sine 等峰（PEAK_FACTOR）、弱音档取其 7 成，
+    // 两档仍保留「点击比划过响」的层级（约 +3.4dB）。音色/包络/比例形状不变，只抬电平。
+    const MIMO_HOVER_PEAK = 0.6; // 弱音档满音量峰值：≈ 其它音色的 7 成，听感接近
+    const MIMO_HIT_PEAK = PEAK_FACTOR; // 强音档满音量峰值 = 0.88（与 sine 等峰，不削波）
     // 滑动速度门槛（原文 Le/qe/Ve/fe 三件套的常量）。
     const MIMO_GATE_ENTRY_MS = 100; // 原文 ke：进入导轨后 <100ms 静音
     const MIMO_GATE_WINDOW_MS = 80; // 原文 He：速度取样窗口
@@ -1154,7 +1160,7 @@ window.__ModuleLoader__.load({
       const master = audio.createGain();
       master.gain.setValueAtTime(0.0001, start);
       master.gain.exponentialRampToValueAtTime(
-        (volume * (strong ? MIMO_HIT_GAIN : MIMO_HOVER_GAIN)) / Math.sqrt(freqs.length),
+        (volume * (strong ? MIMO_HIT_PEAK : MIMO_HOVER_PEAK)) / Math.sqrt(freqs.length),
         start + MIMO_STRUM_ATTACK_S,
       );
       master.gain.exponentialRampToValueAtTime(0.0001, start + duration);
@@ -1208,11 +1214,11 @@ window.__ModuleLoader__.load({
     /**
      * mimo 音色（v0.2.5）：逐行移植原文 `p(freq, strong)` ——
      * 单个 triangle 振荡器，1e-4 起步、8ms 指数升到峰值、再指数衰减回 1e-4，
-     * 峰值与时长按两档（强音 0.3 / 0.9s、弱音 0.13 / 0.42s），停振各留 0.05s。
+     * 峰值与时长按两档（强音档 0.9s、弱音档 0.42s 衰减，停振各留 0.05s），形状与原文一致。
      *
      * 强音档由 meta.strong（明确手势：点击刻度 / 键盘激活 / 试听）触发 ——
      * 对应原文的 hit 路径 `p(s(d,m), !0)`；hover 路径传 `!1` 走弱音。
-     * 峰值就是原文的绝对增益（0.13 / 0.3），再乘本项目音量：音量 100% = 与 mimo 等响。
+     * 生效峰值 = MIMO_HIT_PEAK / MIMO_HOVER_PEAK（v0.2.7 起对齐其它音色响度），再乘本项目音量。
      *
      * v0.2.6 分发：meta.strum = { freqs, ring, strong } 时改播刮弦音 ——
      * 来源有两条：① 快速滑动（本项目增强，strong=false 对应原文 hover 的弱音档）；
@@ -1231,7 +1237,7 @@ window.__ModuleLoader__.load({
       }
       const start = audio.currentTime;
       const strong = meta !== null && meta !== undefined && meta.strong === true;
-      const peak = volume * (strong ? MIMO_HIT_GAIN : MIMO_HOVER_GAIN);
+      const peak = volume * (strong ? MIMO_HIT_PEAK : MIMO_HOVER_PEAK);
       const decay = strong ? MIMO_HIT_DECAY_S : MIMO_DECAY_S;
       const oscillator = audio.createOscillator();
       const gain = audio.createGain();
@@ -2748,6 +2754,8 @@ window.__ModuleLoader__.load({
         MIMO_STOP_PAD_S,
         MIMO_HOVER_GAIN,
         MIMO_HIT_GAIN,
+        MIMO_HOVER_PEAK,
+        MIMO_HIT_PEAK,
         MIMO_GATE_ENTRY_MS,
         MIMO_GATE_WINDOW_MS,
         MIMO_GATE_MAX_SPEED,
