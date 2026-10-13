@@ -19,7 +19,7 @@
 window.__ModuleLoader__.load({
   id: 'dsh-rail-tones',
   factory(require) {
-    const VERSION = '0.2.3';
+    const VERSION = '0.2.5';
 
     /* ------------------------------------------------------------------ *
      * 常量                                                                *
@@ -38,12 +38,23 @@ window.__ModuleLoader__.load({
     const SETTINGS_MAX_TRIES = 60; // 有界重试上限（约 24 秒）
     const TICK_SELECTOR = 'button[data-index]'; // 官方刻度按钮
     const STORE_KEY = 'dsh-rail-tones:v1';
-    // 音效注册表：新增音效 = 这里加一条 + 引擎 SYNTHESIZERS 加一个合成器 + 中英文案各一条；
-    // 设置页的展开式选择列表与存储白名单都从这里派生，UI/存储代码零改动。顺序即列表顺序。
+    // 音效注册表（单一来源）：条目直接持有合成器，引擎/UI/存储白名单全部从注册表派生。
+    // 新增音效 = 这里加一条 + 中英文案各一条；未来自定义音效 = 运行时往注册表注入条目即可，
+    // normalizeVoice / 设置页 / 引擎分发都不需要再改。顺序即设置页列表顺序。
+    // synth: (audio, hz, volume, meta) => boolean，实现见下方「合成器」小节（函数声明提升，顺序无约束）；
+    // 可选 pitchAt(context) => Hz 让音色自带音高映射（mimo = 刻度下标/刻度总数）。
     const VOICE_OPTIONS = Object.freeze([
-      Object.freeze({ id: 'sine', labelKey: 'voiceSine', descKey: 'voiceSineDesc' }),
-      Object.freeze({ id: 'piano', labelKey: 'voicePiano', descKey: 'voicePianoDesc' }),
-      Object.freeze({ id: 'chime', labelKey: 'voiceChime', descKey: 'voiceChimeDesc' }),
+      Object.freeze({ id: 'sine', labelKey: 'voiceSine', descKey: 'voiceSineDesc', synth: playSine }),
+      Object.freeze({ id: 'piano', labelKey: 'voicePiano', descKey: 'voicePianoDesc', synth: playPiano }),
+      Object.freeze({ id: 'chime', labelKey: 'voiceChime', descKey: 'voiceChimeDesc', synth: playChime }),
+      // mimo：条目自带 pitchAt，音高映射随音色走（见「音高映射」小节）。
+      Object.freeze({
+        id: 'mimo',
+        labelKey: 'voiceMimo',
+        descKey: 'voiceMimoDesc',
+        synth: playMimo,
+        pitchAt: mimoHzFor,
+      }),
     ]);
     const VOICES = Object.freeze(
       VOICE_OPTIONS.reduce((acc, option) => {
@@ -81,6 +92,41 @@ window.__ModuleLoader__.load({
     const CHIME_ATTACK_S = 0.03; // 起音 30ms：比 sine/piano 软，去掉敲击感、保留响应灵敏
     const CHIME_DECAY_S = 0.85; // 指数衰减到 0.0001（-80dB）→ -20dB 点 ≈ 0.21s，与实测余韵对齐
     const CHIME_PEAK_SCALE = 0.9; // 满音量峰值 = PEAK_FACTOR × 0.9 ≈ 0.79，留头部空间
+    // mimo 移植（v0.2.5）：逐行照搬逆向出的 mimo 导航条发声逻辑
+    // （resources/app.asar → out/renderer/assets/SessionSpine-CiwyKkwv.js 里返回
+    //  {hover, hit, endEngagement, resetEgg} 的那个 IIFE）。原文片段：
+    //   r=[261.63,293.66,329.63,392,440]
+    //   s=(d,m)=>{const C=Math.round(d/Math.max(1,m-1)*(r.length*3.6));
+    //             return r[C%r.length]*Math.pow(2,Math.floor(C/r.length)-1)}
+    //   p=(d,m)=>{F.type="triangle"; v.gain.setValueAtTime(1e-4,h);
+    //             v.gain.exponentialRampToValueAtTime(m?.3:.13,h+.008);
+    //             v.gain.exponentialRampToValueAtTime(1e-4,h+(m?.9:.42));
+    //             F.start(h); F.stop(h+(m?.95:.46))}
+    //   Le=()=>({entryAt:null,samples:[]}); He=80; ke=100; je=600
+    //   Ve=(e,r)=>{if(e.entryAt==null||r-e.entryAt<ke)return!1;
+    //              if(e.samples.length<2)return!0;
+    //              const p=l.t-s.t; return p<=0?!0:Math.hypot(...)/p*1e3<je}
+    // 关键点（上一版复刻搞错的五处，这里逐条对齐）：
+    //   ① 音高的分母是**刻度总数**（m = s.length）、分子是**刻度下标**（d），
+    //      不是指针的 0…1 位置；18 档阶梯铺满整条导轨（5 刻度时 130.8→1568Hz）。
+    //   ② Ve 的方向是「**慢**于 600px/s 才放行」，快速甩动静音；进入导轨 <100ms 也静音。
+    //   ③ hit（点击）走**强音**档 0.3 / 0.9s；只有 hover 走弱音档 0.13 / 0.42s。
+    //      （原文 hit 里的 H() 分支恒假，但 p(s(d,m),!0) 这条正常路径是活的。）
+    //   ④ 峰值就是原文的绝对增益 0.13 / 0.3（mimo 本体没有音量概念；本项目音量
+    //      100% = 与 mimo 等响，50% = 一半）。
+    //   ⑤ 去重粒度是**刻度下标**（原文 `c!==w.current`），不是本项目的 10 档音级。
+    const MIMO_NOTES = Object.freeze([261.63, 293.66, 329.63, 392, 440]); // C4 D4 E4 G4 A4
+    const MIMO_STEPS = MIMO_NOTES.length * 3.6; // 18：mimo 的 r.length*3.6
+    const MIMO_ATTACK_S = 0.008; // 原文 h+.008
+    const MIMO_DECAY_S = 0.42; // hover 档衰减（原文 m?.9:.42）
+    const MIMO_HIT_DECAY_S = 0.9; // 强音档衰减
+    const MIMO_STOP_PAD_S = 0.05; // 停振余量（原文 .95/.46 对 .9/.42）
+    const MIMO_HOVER_GAIN = 0.13; // hover 档峰值（原文绝对增益）
+    const MIMO_HIT_GAIN = 0.3; // 强音档峰值（原文绝对增益）
+    // 滑动速度门槛（原文 Le/qe/Ve/fe 三件套的常量）。
+    const MIMO_GATE_ENTRY_MS = 100; // 原文 ke：进入导轨后 <100ms 静音
+    const MIMO_GATE_WINDOW_MS = 80; // 原文 He：速度取样窗口
+    const MIMO_GATE_MAX_SPEED = 600; // 原文 je：速度 ≥600px/s 静音（慢速才放行）
 
     const MESSAGES = {
       zh: {
@@ -97,6 +143,8 @@ window.__ModuleLoader__.load({
         voicePianoDesc: '多分音合成的钢琴质感',
         voiceChime: '清音',
         voiceChimeDesc: '基频为主、带高泛音的软钟提示音',
+        voiceMimo: 'MiMo',
+        voiceMimoDesc: '小米 MiMo 桌面端导航条音效的逐行移植（三角波 + C 大调五声 18 档）',
         preview: '试听',
         previewDesc: '试听会话中段对应的提示音（关闭开关后试听同样静音）。',
         previewButton: '试听',
@@ -115,6 +163,8 @@ window.__ModuleLoader__.load({
         voicePianoDesc: 'Multi-partial synthesized piano',
         voiceChime: 'Chime',
         voiceChimeDesc: 'Soft bell tone with a bright high partial',
+        voiceMimo: 'MiMo',
+        voiceMimoDesc: 'Line-by-line port of the Xiaomi MiMo desktop rail tone (triangle, C-major pentatonic, 18 steps)',
         preview: 'Preview',
         previewDesc: 'Plays the tone for the middle of the session (silent while the switch is off).',
         previewButton: 'Preview',
@@ -156,6 +206,68 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * mimo 的音高映射（与原文 `s(d, m)` 逐字等价）：
+     *   C = round(d / max(1, m-1) × 18)；f = NOTES[C % 5] × 2^(⌊C/5⌋ − 1)
+     * 其中 d = **刻度下标**（0 基，取 data-index）、m = **刻度总数**。
+     * 5 个刻度时逐档为 C3 D3 E3 G3 A3 …（整条 18 档阶梯铺满导轨，130.8→1568Hz）。
+     *
+     * 传入非法值时返回 null（调用方回退位置映射）。
+     */
+    function mimoFrequencyAt(step, count) {
+      if (typeof step !== 'number' || !Number.isFinite(step)) return null;
+      const total = typeof count === 'number' && Number.isFinite(count) && count > 0 ? count : null;
+      if (total === null) return null;
+      const index = Math.max(0, step);
+      const c = Math.round((index / Math.max(1, total - 1)) * MIMO_STEPS);
+      const ratio = MIMO_NOTES.length;
+      return MIMO_NOTES[c % ratio] * Math.pow(2, Math.floor(c / ratio) - 1);
+    }
+
+    /**
+     * mimo 音色的音高解析：优先用「刻度下标 / 刻度总数」（原文语义）；
+     * 没有刻度信息时（试听 / 无 data-index 的宿主）退化为「刻度均匀铺满」的等价形态：
+     * step = round(position × 17)、count = 18 —— 与原文在刻度铺满导轨时同形。
+     */
+    function mimoHzFor(context) {
+      if (context === null || typeof context !== 'object') return null;
+      const { tick, tickCount, position } = context;
+      if (typeof tick === 'number' && Number.isFinite(tick) && tickCount !== null && tickCount !== undefined) {
+        return mimoFrequencyAt(tick, tickCount);
+      }
+      const bounded = clamp01(position);
+      if (bounded === null) return null;
+      return mimoFrequencyAt(Math.round(bounded * (MIMO_STEPS - 1)), MIMO_STEPS);
+    }
+
+    /** 注册表里取「音色自带的音高映射」；没带的音色返回 null（回退全局映射）。 */
+    function pitchForVoice(voice) {
+      for (const option of VOICE_OPTIONS) {
+        if (option.id === voice && typeof option.pitchAt === 'function') return option.pitchAt;
+      }
+      return null;
+    }
+
+    /**
+     * 音高解析（apply 装配进 createController 的 pitchAt）。
+     * context = { degree, position, tick, tickCount, source }；返回 null 表示
+     * 「该音色没有自带映射」→ 调度器回退 `noteHz(degree)`。
+     */
+    function resolvePitch(pitch, context) {
+      if (typeof pitch !== 'function') return null;
+      return pitch(context);
+    }
+
+    /**
+     * 去重键（apply 装配进 createController 的 keyFor / 监听层的 env.keyFor）：
+     * mimo 音色按**刻度下标**去重（原文 `c !== w.current` 的语义 —— 每个刻度各响一声），
+     * 其它音色维持本项目原有的「10 档音级」去重。
+     */
+    function dedupKeyFor(voice, degree, tick) {
+      if (voice === 'mimo' && typeof tick === 'number' && Number.isFinite(tick)) return tick;
+      return degree;
+    }
+
+    /**
      * 视口坐标 → 导轨内容位置。
      * geometry: { y, rectTop, scrollTop, scrollHeight }，全部为数字。
      */
@@ -188,40 +300,143 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * mimo 的滑动速度门槛（逐行移植原文 Le/qe/Ve/fe）：
+     *   qe：首次进入时记 entryAt，push 采样，丢弃早于 80ms 窗口的样本；
+     *   Ve：entryAt 为空或「进入导轨不足 100ms」→ 不放行；
+     *       样本 <2 帧 → 放行；否则算窗口内速度，**慢于 600px/s 才放行**；
+     *   fe：离开导轨（或 blur）→ 清空 entryAt 与采样。
+     *
+     * 注意方向：这是「**快速甩动静音**」的门槛（防止飞速划过时音符连成一片），
+     * 不是「慢速静音」。v0.2.4 曾把它写反，v0.2.5 按原文更正。
+     * 只有「光标划过」（pointermove）带手势上下文；点击 / 键盘 / 滚轮 / 试听不判
+     * （原文 hit 路径也不经过 Ve）。
+     */
+    function createMimoGate(options) {
+      const settings = options === null || typeof options !== 'object' ? {} : options;
+      const entryMs = typeof settings.entryMs === 'number' ? settings.entryMs : MIMO_GATE_ENTRY_MS;
+      const maxSpeed = typeof settings.maxSpeed === 'number' ? settings.maxSpeed : MIMO_GATE_MAX_SPEED;
+      const windowMs = typeof settings.windowMs === 'number' ? settings.windowMs : MIMO_GATE_WINDOW_MS;
+      let entryAt = null;
+      let samples = [];
+
+      return {
+        /** gesture: { x, y } 本次划过位置；at: 事件时间戳（ms）。 */
+        allow(gesture, at) {
+          // 没有可用的手势数据时不做速度判定（调用方只在 hover 路径传）
+          if (gesture === null || typeof gesture !== 'object') return true;
+          if (typeof at !== 'number' || !Number.isFinite(at)) return true;
+          const x = Number(gesture.x);
+          const y = Number(gesture.y);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return true;
+          // qe：首次采样即记 entryAt（原文 e.entryAt == null && (e.entryAt = l)）
+          if (entryAt === null) entryAt = at;
+          samples.push({ x, y, t: at });
+          // qe：丢弃早于窗口的样本（原文 while samples[0].t < t - He）
+          while (samples.length > 0 && at - samples[0].t > windowMs) samples.shift();
+          // Ve：进入导轨不足 100ms 静音
+          if (at - entryAt < entryMs) return false;
+          // Ve：样本不足两帧直接放行
+          if (samples.length < 2) return true;
+          const first = samples[0];
+          const latest = samples[samples.length - 1];
+          const elapsed = latest.t - first.t;
+          if (elapsed <= 0) return true; // 原文 p <= 0 ⇒ true
+          const speed = (Math.hypot(latest.x - first.x, latest.y - first.y) / elapsed) * 1000;
+          return speed < maxSpeed; // 慢速放行、快速甩动静音
+        },
+        /** fe：离开导轨（或 blur）后复位：下一段手势重新计时。 */
+        reset() {
+          entryAt = null;
+          samples = [];
+        },
+        /** 诊断用：当前取样窗口内的样本数与进入时刻。 */
+        stats() {
+          return { entryAt, samples: samples.length };
+        },
+      };
+    }
+
+    /**
      * 发声调度器：节流 + 同音级去重 + 开关判断。
-     * options: { play(hz, meta), now(), isEnabled(), minGapMs?, sameDegreeMs? }
+     * options: { play(hz, meta), now(), isEnabled(), minGapMs?, sameDegreeMs?, pitchAt?, gate?, keyFor? }
+     *
+     * v0.2.5：pitchAt(context) 接收 {degree, position, tick, tickCount, source}，
+     * 让音色自带音高映射（mimo = 刻度下标/刻度总数）；keyFor(degree, tick) 让
+     * 音色切换去重粒度（mimo = 刻度下标）；meta.strong = 明确手势 → 强音档。
      */
     function createController(options) {
       const settings = options === null || typeof options !== 'object' ? {} : options;
       const now = typeof settings.now === 'function' ? settings.now : () => Date.now();
       const minGapMs = typeof settings.minGapMs === 'number' ? settings.minGapMs : MIN_GAP_MS;
       const sameDegreeMs = typeof settings.sameDegreeMs === 'number' ? settings.sameDegreeMs : SAME_DEGREE_MS;
+      // 音高映射：优先用注入的「按音色取映射」回调（apply 注入），测试缺省时回退全局。
+      const resolver = typeof settings.pitchAt === 'function' ? settings.pitchAt : () => null;
+      // 滑动速度门槛（mimo 音色专用）：第五参为手势上下文时才会被问到。
+      const gate = typeof settings.gate === 'function' ? settings.gate : null;
+      // 去重键：默认按音级；mimo 音色按刻度下标（见 dedupKeyFor）。
+      const keyFor = typeof settings.keyFor === 'function' ? settings.keyFor : null;
       let lastAt = Number.NEGATIVE_INFINITY;
       let lastDegree = null;
       let lastHz = null;
       let notesPlayed = 0;
 
-      function signal(position, source, tick, options) {
+      function signal(position, source, tick, options, gesture) {
         if (typeof settings.isEnabled === 'function' && settings.isEnabled() !== true) return false;
         const degree = degreeForPosition(position);
         if (degree === null) return false;
-        // repeat = 明确的手势（按下 / 键盘激活）：即便与上一声同音级也再响一次，
+        const tickIndex = typeof tick === 'number' && Number.isFinite(tick) ? tick : null;
+        // 去重键：mimo 音色按刻度下标（原文 c !== w.current），其余音色按 10 档音级。
+        let key = degree;
+        if (keyFor !== null) {
+          try {
+            const custom = keyFor(degree, tickIndex);
+            if (custom !== null && custom !== undefined) key = custom;
+          } catch (error) {
+            key = degree;
+          }
+        }
+        // repeat = 明确的手势（按下 / 键盘激活）：即便与上一声同键也再响一次，
         // 让「点击刻度」始终有确认音；划过/滚轮不带 repeat，避免同一刻度反复响。
         const repeat = options !== null && options !== undefined && options.repeat === true;
         const at = now();
         if (at - lastAt < minGapMs) return false;
-        if (!repeat && degree === lastDegree && at - lastAt < sameDegreeMs) return false;
-        const hz = noteHz(degree);
+        if (!repeat && key === lastDegree && at - lastAt < sameDegreeMs) return false;
+        // 音高：注册表里该音色自带映射（如 mimo）就用它，否则用全局位置→音级→频率。
+        const context = {
+          degree,
+          position,
+          tick: tickIndex,
+          tickCount:
+            gesture !== null && gesture !== undefined && typeof gesture.tickCount === 'number'
+              ? gesture.tickCount
+              : null,
+          source: typeof source === 'string' ? source : 'rail',
+        };
+        let hz = null;
+        try {
+          hz = resolver(context);
+        } catch (error) {
+          hz = null;
+        }
+        if (typeof hz !== 'number' || !Number.isFinite(hz)) hz = noteHz(degree);
         if (hz === null) return false;
+        // 滑动速度门槛（mimo 音色）：只作用于「光标划过」（gesture.hover）——
+        // 点击 / 键盘 / 滚轮 / 试听照常发声（原文 hit 路径也不走 Ve）。
+        if (gate !== null && gesture !== null && gesture !== undefined && gesture.hover === true) {
+          if (gate(gesture, at) !== true) return false;
+        }
         lastAt = at;
-        lastDegree = degree;
+        lastDegree = key;
         lastHz = hz;
         notesPlayed += 1;
         if (typeof settings.play === 'function') {
           settings.play(hz, {
             degree,
+            key,
+            // 明确手势 = 强音档（原文 hit → p(s(d,m), !0)：0.3 / 0.9s）。
+            strong: repeat === true,
             source: typeof source === 'string' ? source : 'rail',
-            tick: typeof tick === 'number' && Number.isFinite(tick) ? tick : null,
+            tick: tickIndex,
           });
         }
         return true;
@@ -316,6 +531,184 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** 正弦音（v0.2.0 之前的唯一音色）：单振荡器 + 起音 + 指数衰减。 */
+    function playSine(audio, hz, volume) {
+      const start = audio.currentTime;
+      const peak = volume * PEAK_FACTOR;
+      const oscillator = audio.createOscillator();
+      const gain = audio.createGain();
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(hz, start);
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.linearRampToValueAtTime(peak, start + ATTACK_S);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + DECAY_S);
+      oscillator.connect(gain);
+      gain.connect(audio.destination);
+      oscillator.start(start);
+      oscillator.stop(start + DECAY_S + 0.02);
+      oscillator.onended = () => {
+        try {
+          oscillator.disconnect();
+          gain.disconnect();
+        } catch (error) {
+          /* 已断开 */
+        }
+      };
+      return true;
+    }
+
+    /**
+     * 钢琴音色：master gain 包络下并联 6 个正弦分音，
+     * 权重按 Σ 归一（任意时刻 |Σ 分音| ≤ master 峰值，不削波）、频率带轻微失谐、
+     * 高次分音按各自 τ 更快衰减（先亮后暗的琴声瞬态），并在衰减到位后才 stop（避免爆音）。
+     */
+    function playPiano(audio, hz, volume) {
+      const start = audio.currentTime;
+      const peak = volume * PEAK_FACTOR * PIANO_PEAK_SCALE;
+      const master = audio.createGain();
+      master.gain.setValueAtTime(0.0001, start);
+      master.gain.linearRampToValueAtTime(peak, start + ATTACK_S);
+      master.gain.exponentialRampToValueAtTime(0.0001, start + PIANO_DECAY_S);
+      master.connect(audio.destination);
+      const partials = [];
+      for (let i = 0; i < PIANO_WEIGHTS.length; i += 1) {
+        const n = i + 1;
+        const oscillator = audio.createOscillator();
+        const gain = audio.createGain();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(hz * n * (1 + PIANO_INHARM * n * n), start);
+        const tau = PIANO_DECAY_S * PIANO_TAUS[i];
+        gain.gain.setValueAtTime(PIANO_WEIGHTS[i] / PIANO_WEIGHT_SUM, start);
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + tau);
+        oscillator.connect(gain);
+        gain.connect(master);
+        oscillator.start(start);
+        oscillator.stop(start + tau + 0.02);
+        partials.push({ oscillator, gain });
+      }
+      // 任一分音结束即统一回收（同节流窗口内它们几乎同时收尾，逐个挂 onended 反而啰嗦）。
+      partials[0].oscillator.onended = () => {
+        for (const part of partials) {
+          try {
+            part.oscillator.disconnect();
+            part.gain.disconnect();
+          } catch (error) {
+            /* 已断开 */
+          }
+        }
+        try {
+          master.disconnect();
+        } catch (error) {
+          /* 已断开 */
+        }
+      };
+      return true;
+    }
+
+    /**
+     * 清音（v0.2.2）：主音 + 钟类无谐分音 + 上方五度 40ms 引导音的软钟音（贴近实测的 mimo 提示音）。
+     * 主音 2 个分音并联进 master gain（权重按 Σ 归一 → 不削波）；引导音独立 gain，
+     * 在主音起音前响 40ms（复刻实测的快速下行琶音）；master 指数衰减 -80dB（-20dB ≈ 0.21s）。
+     */
+    function playChime(audio, hz, volume) {
+      const start = audio.currentTime;
+      const peak = volume * PEAK_FACTOR * CHIME_PEAK_SCALE;
+      const master = audio.createGain();
+      master.gain.setValueAtTime(0.0001, start);
+      master.gain.linearRampToValueAtTime(peak, start + CHIME_ATTACK_S);
+      master.gain.exponentialRampToValueAtTime(0.0001, start + CHIME_DECAY_S);
+      master.connect(audio.destination);
+      const partials = [];
+      // 主音分音（基频 + 1.5× 钟类质感分音）。
+      for (let i = 0; i < CHIME_WEIGHTS.length; i += 1) {
+        const oscillator = audio.createOscillator();
+        const gain = audio.createGain();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(hz * CHIME_RATIOS[i], start);
+        gain.gain.setValueAtTime(CHIME_WEIGHTS[i] / CHIME_WEIGHT_SUM, start);
+        oscillator.connect(gain);
+        gain.connect(master);
+        oscillator.start(start);
+        oscillator.stop(start + CHIME_DECAY_S + 0.02);
+        partials.push({ oscillator, gain });
+      }
+      // 引导音：主音起音前 40ms 短促上方五度（实测琶音的末两级关系），随主音 master 包络衰减。
+      const leadOsc = audio.createOscillator();
+      const leadGain = audio.createGain();
+      leadOsc.type = 'sine';
+      leadOsc.frequency.setValueAtTime(hz * CHIME_LEAD_RATIO, start);
+      leadGain.gain.setValueAtTime(0.0001, start);
+      leadGain.gain.linearRampToValueAtTime(CHIME_LEAD_LEVEL / (CHIME_LEAD_LEVEL + 1), start + CHIME_LEAD_S * 0.4);
+      leadGain.gain.exponentialRampToValueAtTime(0.0001, start + CHIME_LEAD_S);
+      leadOsc.connect(leadGain);
+      leadGain.connect(master);
+      leadOsc.start(start);
+      leadOsc.stop(start + CHIME_LEAD_S + 0.02);
+      partials.push({ oscillator: leadOsc, gain: leadGain });
+      // 任一分音结束即统一回收（与 playPiano 同一模式）。
+      partials[0].oscillator.onended = () => {
+        for (const part of partials) {
+          try {
+            part.oscillator.disconnect();
+            part.gain.disconnect();
+          } catch (error) {
+            /* 已断开 */
+          }
+        }
+        try {
+          master.disconnect();
+        } catch (error) {
+          /* 已断开 */
+        }
+      };
+      return true;
+    }
+
+
+    /**
+     * mimo 音色（v0.2.5）：逐行移植原文 `p(freq, strong)` ——
+     * 单个 triangle 振荡器，1e-4 起步、8ms 指数升到峰值、再指数衰减回 1e-4，
+     * 峰值与时长按两档（强音 0.3 / 0.9s、弱音 0.13 / 0.42s），停振各留 0.05s。
+     *
+     * 强音档由 meta.strong（明确手势：点击刻度 / 键盘激活 / 试听）触发 ——
+     * 对应原文的 hit 路径 `p(s(d,m), !0)`；hover 路径传 `!1` 走弱音。
+     * 峰值就是原文的绝对增益（0.13 / 0.3），再乘本项目音量：音量 100% = 与 mimo 等响。
+     */
+    function playMimo(audio, hz, volume, meta) {
+      const start = audio.currentTime;
+      const strong = meta !== null && meta !== undefined && meta.strong === true;
+      const peak = volume * (strong ? MIMO_HIT_GAIN : MIMO_HOVER_GAIN);
+      const decay = strong ? MIMO_HIT_DECAY_S : MIMO_DECAY_S;
+      const oscillator = audio.createOscillator();
+      const gain = audio.createGain();
+      oscillator.type = 'triangle'; // 原文 F.type = "triangle"
+      oscillator.frequency.setValueAtTime(hz, start);
+      gain.gain.setValueAtTime(0.0001, start); // 原文 setValueAtTime(1e-4, h)
+      gain.gain.exponentialRampToValueAtTime(peak, start + MIMO_ATTACK_S); // 原文 h+.008
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + decay); // 原文 h+(strong?.9:.42)
+      oscillator.connect(gain);
+      gain.connect(audio.destination);
+      oscillator.start(start);
+      oscillator.stop(start + decay + MIMO_STOP_PAD_S); // 原文 h+(strong?.95:.46)
+      oscillator.onended = () => {
+        try {
+          oscillator.disconnect();
+          gain.disconnect();
+        } catch (error) {
+          /* 已断开 */
+        }
+      };
+      return true;
+    }
+
+    /** 注册表查询器：音色 id → 合成器，未知 id / 非法输入一律返回 null。 */
+    function synthForVoice(voice) {
+      for (const option of VOICE_OPTIONS) {
+        if (option.id === voice && typeof option.synth === 'function') return option.synth;
+      }
+      return null;
+    }
+
     /* ------------------------------------------------------------------ *
      * 音频引擎（Web Audio 合成，无音频素材）                              *
      * ------------------------------------------------------------------ */
@@ -355,14 +748,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      /**
-       * 合成器注册表：音效 id → (audio, hz, volume) => boolean。
-       * 新音效（含未来的自定义音效）在这里挂上对应的 play* 实现即可，
-       * 分发与 UI 都不需要再改。
-       */
-      const SYNTHESIZERS = { sine: playSine, piano: playPiano, chime: playChime };
-
-      function play(hz) {
+      function play(hz, meta) {
         if (typeof hz !== 'number' || !Number.isFinite(hz)) return false;
         let volume = 0;
         try {
@@ -386,147 +772,19 @@ window.__ModuleLoader__.load({
         // 手势、不预热上下文，纯滚轮用户第一声必踩这个坑）。
         if (audio.state !== 'running') return false;
         const bounded = Math.min(MAX_VOLUME, Math.max(0, volume));
-        // 分发查注册表：未知 id（如未接上合成器的新音效）兜底默认合成器，绝不抛错。
-        const synth = SYNTHESIZERS[voice] === undefined ? SYNTHESIZERS[DEFAULTS.voice] : SYNTHESIZERS[voice];
+        // 分发查注入的注册表查询器（apply 注入 synthForVoice，测试缺省时用顶层同名函数）；
+        // 未知 id（如已删掉的音色）兜底默认音色，绝不抛错。
+        const resolve = typeof options.synth === 'function' ? options.synth : synthForVoice;
+        let synth = resolve(voice);
+        if (typeof synth !== 'function') synth = synthForVoice(DEFAULTS.voice);
         try {
-          return synth(audio, hz, bounded);
+          // 第 4 参是手势元数据（source 等）：只有 mimo 复刻音色用得到（区分强音档），
+          // 既有合成器忽略它，签名保持向后兼容。
+          return synth(audio, hz, bounded, meta);
         } catch (error) {
           report(error);
           return false;
         }
-      }
-
-      /** 正弦音（v0.2.0 之前的唯一音色）：单振荡器 + 起音 + 指数衰减。 */
-      function playSine(audio, hz, volume) {
-        const start = audio.currentTime;
-        const peak = volume * PEAK_FACTOR;
-        const oscillator = audio.createOscillator();
-        const gain = audio.createGain();
-        oscillator.type = 'sine';
-        oscillator.frequency.setValueAtTime(hz, start);
-        gain.gain.setValueAtTime(0.0001, start);
-        gain.gain.linearRampToValueAtTime(peak, start + ATTACK_S);
-        gain.gain.exponentialRampToValueAtTime(0.0001, start + DECAY_S);
-        oscillator.connect(gain);
-        gain.connect(audio.destination);
-        oscillator.start(start);
-        oscillator.stop(start + DECAY_S + 0.02);
-        oscillator.onended = () => {
-          try {
-            oscillator.disconnect();
-            gain.disconnect();
-          } catch (error) {
-            /* 已断开 */
-          }
-        };
-        return true;
-      }
-
-      /**
-       * 钢琴音色：master gain 包络下并联 6 个正弦分音，
-       * 权重按 Σ 归一（任意时刻 |Σ 分音| ≤ master 峰值，不削波）、频率带轻微失谐、
-       * 高次分音按各自 τ 更快衰减（先亮后暗的琴声瞬态），并在衰减到位后才 stop（避免爆音）。
-       */
-      function playPiano(audio, hz, volume) {
-        const start = audio.currentTime;
-        const peak = volume * PEAK_FACTOR * PIANO_PEAK_SCALE;
-        const master = audio.createGain();
-        master.gain.setValueAtTime(0.0001, start);
-        master.gain.linearRampToValueAtTime(peak, start + ATTACK_S);
-        master.gain.exponentialRampToValueAtTime(0.0001, start + PIANO_DECAY_S);
-        master.connect(audio.destination);
-        const partials = [];
-        for (let i = 0; i < PIANO_WEIGHTS.length; i += 1) {
-          const n = i + 1;
-          const oscillator = audio.createOscillator();
-          const gain = audio.createGain();
-          oscillator.type = 'sine';
-          oscillator.frequency.setValueAtTime(hz * n * (1 + PIANO_INHARM * n * n), start);
-          const tau = PIANO_DECAY_S * PIANO_TAUS[i];
-          gain.gain.setValueAtTime(PIANO_WEIGHTS[i] / PIANO_WEIGHT_SUM, start);
-          gain.gain.exponentialRampToValueAtTime(0.0001, start + tau);
-          oscillator.connect(gain);
-          gain.connect(master);
-          oscillator.start(start);
-          oscillator.stop(start + tau + 0.02);
-          partials.push({ oscillator, gain });
-        }
-        // 任一分音结束即统一回收（同节流窗口内它们几乎同时收尾，逐个挂 onended 反而啰嗦）。
-        partials[0].oscillator.onended = () => {
-          for (const part of partials) {
-            try {
-              part.oscillator.disconnect();
-              part.gain.disconnect();
-            } catch (error) {
-              /* 已断开 */
-            }
-          }
-          try {
-            master.disconnect();
-          } catch (error) {
-            /* 已断开 */
-          }
-        };
-        return true;
-      }
-
-      /**
-       * 清音（v0.2.2）：主音 + 钟类无谐分音 + 上方五度 40ms 引导音的软钟音（贴近实测的 mimo 提示音）。
-       * 主音 2 个分音并联进 master gain（权重按 Σ 归一 → 不削波）；引导音独立 gain，
-       * 在主音起音前响 40ms（复刻实测的快速下行琶音）；master 指数衰减 -80dB（-20dB ≈ 0.21s）。
-       */
-      function playChime(audio, hz, volume) {
-        const start = audio.currentTime;
-        const peak = volume * PEAK_FACTOR * CHIME_PEAK_SCALE;
-        const master = audio.createGain();
-        master.gain.setValueAtTime(0.0001, start);
-        master.gain.linearRampToValueAtTime(peak, start + CHIME_ATTACK_S);
-        master.gain.exponentialRampToValueAtTime(0.0001, start + CHIME_DECAY_S);
-        master.connect(audio.destination);
-        const partials = [];
-        // 主音分音（基频 + 1.5× 钟类质感分音）。
-        for (let i = 0; i < CHIME_WEIGHTS.length; i += 1) {
-          const oscillator = audio.createOscillator();
-          const gain = audio.createGain();
-          oscillator.type = 'sine';
-          oscillator.frequency.setValueAtTime(hz * CHIME_RATIOS[i], start);
-          gain.gain.setValueAtTime(CHIME_WEIGHTS[i] / CHIME_WEIGHT_SUM, start);
-          oscillator.connect(gain);
-          gain.connect(master);
-          oscillator.start(start);
-          oscillator.stop(start + CHIME_DECAY_S + 0.02);
-          partials.push({ oscillator, gain });
-        }
-        // 引导音：主音起音前 40ms 短促上方五度（实测琶音的末两级关系），随主音 master 包络衰减。
-        const leadOsc = audio.createOscillator();
-        const leadGain = audio.createGain();
-        leadOsc.type = 'sine';
-        leadOsc.frequency.setValueAtTime(hz * CHIME_LEAD_RATIO, start);
-        leadGain.gain.setValueAtTime(0.0001, start);
-        leadGain.gain.linearRampToValueAtTime(CHIME_LEAD_LEVEL / (CHIME_LEAD_LEVEL + 1), start + CHIME_LEAD_S * 0.4);
-        leadGain.gain.exponentialRampToValueAtTime(0.0001, start + CHIME_LEAD_S);
-        leadOsc.connect(leadGain);
-        leadGain.connect(master);
-        leadOsc.start(start);
-        leadOsc.stop(start + CHIME_LEAD_S + 0.02);
-        partials.push({ oscillator: leadOsc, gain: leadGain });
-        // 任一分音结束即统一回收（与 playPiano 同一模式）。
-        partials[0].oscillator.onended = () => {
-          for (const part of partials) {
-            try {
-              part.oscillator.disconnect();
-              part.gain.disconnect();
-            } catch (error) {
-              /* 已断开 */
-            }
-          }
-          try {
-            master.disconnect();
-          } catch (error) {
-            /* 已断开 */
-          }
-        };
-        return true;
       }
 
       return {
@@ -658,6 +916,7 @@ window.__ModuleLoader__.load({
       }
       if (ticks === null || ticks.length === 0) return null;
       let best = null;
+      let highest = -1;
       for (let position = 0; position < ticks.length; position += 1) {
         const tick = ticks[position];
         const center = centerY(tick);
@@ -672,7 +931,20 @@ window.__ModuleLoader__.load({
         }
         best = { distance, center, index };
       }
-      return best === null ? null : { centerY: best.center, index: best.index };
+      for (let position = 0; position < ticks.length; position += 1) {
+        const tick = ticks[position];
+        if (typeof tick.getAttribute !== 'function') continue;
+        const raw = tick.getAttribute('data-index');
+        const parsed = raw === null ? Number.NaN : Number(raw);
+        if (Number.isFinite(parsed) && parsed > highest) highest = parsed;
+      }
+      if (best === null) return null;
+      // count：刻度总数（mimo 的音高分母 m）。虚拟滚动下 DOM 里只有已渲染的刻度，
+      // 此时用「最大 data-index + 1」作为总数估计 —— 与宿主渲染窗口一致，
+      // 指针滑到窗口底部时能落到与之匹配的档位（详见 README）。
+      const rendered = ticks.length;
+      const count = Math.max(rendered, highest + 1);
+      return { centerY: best.center, index: best.index, count };
     }
 
     function positionAt(nav, y, view, knownScroller) {
@@ -705,7 +977,8 @@ window.__ModuleLoader__.load({
     /**
      * 全局委托监听（捕获阶段 + passive）：
      * 不缓存刻度节点（虚拟滚动会回收），不阻止任何默认行为。
-     * env: { view, arm(), signal(position, source, tick, options) }
+     * env: { view, arm(), signal(position, source, tick, options, gesture), gate? }
+     *   gesture = { x, y }（只有 pointermove 带；点击 / 滚轮 / 试听没有 → 不判滑动速度）
      */
     function attachRailListeners(env) {
       const view = env.view;
@@ -740,6 +1013,8 @@ window.__ModuleLoader__.load({
         anchoredTickIndex = null;
         resets += 1;
         lastReset = { reason: typeof reason === 'string' ? reason : 'unknown', at: Date.now() };
+        // 滑动速度门槛的采样也一并复位：真离开再划回来算一段新手势（mimo 的 fe() 同义）。
+        if (env.gate !== null && env.gate !== undefined && typeof env.gate.reset === 'function') env.gate.reset();
       }
 
       function cancelOffRailReset() {
@@ -805,7 +1080,7 @@ window.__ModuleLoader__.load({
         return null;
       }
 
-      function emit(nav, y, source, scroller, force) {
+      function emit(nav, y, source, scroller, force, x) {
         const target = scroller === undefined || scroller === null ? scrollerForCached(nav) : scroller;
         // 音符由「指针所在刻度」决定：先吸附到刻度中线再换算位置，
         // 于是同一刻度上划过 / 按住滑动 / 点击 / 滚轮都得到同一个音。
@@ -818,20 +1093,48 @@ window.__ModuleLoader__.load({
         }
         if (tick !== null && tick.index !== null) anchoredTickIndex = tick.index;
         const index = tick === null ? null : tick.index;
+        const tickCount = tick === null ? null : tick.count;
         const position = positionAt(nav, tick === null ? y : tick.centerY, view, target);
         if (position === null) return false;
         const degree = degreeForPosition(position);
-        // 闸门：音级没变就不发声。指针停在原处（哪怕手抖出几十个 pointermove、
+        // 去重键：默认 = 音级；mimo 音色 = 刻度下标（与控制器同一函数，见 dedupKeyFor）。
+        // 监听层这道闸门必须与控制器一致，否则 mimo 音色会被 10 档音级提前拦掉。
+        let key = degree;
+        if (typeof env.keyFor === 'function') {
+          try {
+            const custom = env.keyFor(degree, Number.isFinite(index) ? index : null);
+            if (custom !== null && custom !== undefined) key = custom;
+          } catch (error) {
+            key = degree;
+          }
+        }
+        // 闸门：键没变就不发声。指针停在原处（哪怕手抖出几十个 pointermove、
         // 哪怕宿主在重渲染、哪怕刻度节点被虚拟滚动回收）都不会重复响。
-        if (force !== true && degree !== null && degree === lastDegree) {
+        if (force !== true && key !== null && key === lastDegree) {
           skippedByDegree += 1;
-          lastSkip = { reason: 'degree', at: Date.now(), degree, tick: Number.isFinite(index) ? index : null, source };
+          lastSkip = { reason: 'degree', at: Date.now(), degree: key, tick: Number.isFinite(index) ? index : null, source };
           return false;
         }
-        const accepted = env.signal(position, source, Number.isFinite(index) ? index : null, force === true ? { repeat: true } : undefined);
+        // 手势上下文只给「光标划过」（pointermove）那一路：mimo 的滑动速度门槛只作用于悬停，
+        // 点击 / 键盘 / 滚轮 / 试听一律照常发声（原文 hit 路径也不走 Ve）。
+        // tick / tickCount 对所有来源都有意义（mimo 的音高由刻度下标与总数决定）。
+        const gesture = {
+          x: Number.isFinite(x) ? x : null,
+          y: Number.isFinite(y) ? y : null,
+          tick: Number.isFinite(index) ? index : null,
+          tickCount: typeof tickCount === 'number' && Number.isFinite(tickCount) ? tickCount : null,
+          hover: source === 'hover',
+        };
+        const accepted = env.signal(
+          position,
+          source,
+          Number.isFinite(index) ? index : null,
+          force === true ? { repeat: true } : undefined,
+          gesture,
+        );
         if (accepted === true) {
           acceptedCount += 1;
-          if (degree !== null) lastDegree = degree;
+          if (key !== null) lastDegree = key;
           lastTickIndex = Number.isFinite(index) ? index : null;
           lastPosition = position;
         }
@@ -846,7 +1149,7 @@ window.__ModuleLoader__.load({
         activeNav = nav;
         activeScroller = scrollerForCached(nav);
         // 按下是明确手势：即使指针正停在同一刻度上，也再响一声作为确认。
-        emit(nav, event.clientY, 'slide', activeScroller, true);
+        emit(nav, event.clientY, 'slide', activeScroller, true, event.clientX);
       }
 
       function onPointerMove(event) {
@@ -856,7 +1159,7 @@ window.__ModuleLoader__.load({
           // 这一支不走 hit()，待决的「离开」倒计时不会被取消；不显式取消的话，
           // 倒计时会在拖拽中途清掉锚点，同一音级被当成「离开后又进入」而重放。
           cancelOffRailReset();
-          emit(nav, event.clientY, 'slide', activeScroller);
+          emit(nav, event.clientY, 'slide', activeScroller, undefined, event.clientX);
           return;
         }
         // 未按键的光标划过同样发声：这是桌面端「竖向滑动」的形态。
@@ -873,7 +1176,7 @@ window.__ModuleLoader__.load({
           scheduleOffRailReset('move-outside-scroller');
           return;
         }
-        emit(nav, event.clientY, 'hover', scroller);
+        emit(nav, event.clientY, 'hover', scroller, undefined, event.clientX);
       }
 
       function onPointerOut(event) {
@@ -1304,7 +1607,8 @@ window.__ModuleLoader__.load({
         const preview = () => {
           if (state.get().enabled !== true) return;
           controller.reset();
-          controller.signal(0.5, 'preview');
+          // 试听 = 模拟「点击刻度」：走明确手势 → 强音档（与 mimo 的 hit 一致）。
+          controller.signal(0.5, 'preview', null, { repeat: true });
         };
         return h('div', { style: CARD_STYLE }, [
           h(
@@ -1474,16 +1778,26 @@ window.__ModuleLoader__.load({
                 : null,
           volume: () => state.get().volume,
           voice: () => state.get().voice,
+          synth: synthForVoice,
         });
         let lastTick = null;
         let mutedCount = 0;
         const recent = [];
+        // 滑动速度门槛（mimo 复刻音色）：按当前音色开/关采样，并交给监听层复位。
+        const mimoGate = createMimoGate({});
         const controller = createController({
+          // 音高：该音色自带 pitchAt（mimo = 刻度下标/刻度总数）就用它；
+          // 没有自带映射的音色保持「位置→音级→noteHz」的既有行为（返回 null）。
+          pitchAt: (context) => resolvePitch(pitchForVoice(state.get().voice), context),
+          // 去重粒度：mimo 按刻度下标、其它音色按音级（与监听层注入同一个函数）。
+          keyFor: (degree, tick) => dedupKeyFor(state.get().voice, degree, tick),
+          // 门槛只在 mimo 音色下生效：其它音色的划过行为一个字都没变。
+          gate: (gesture, at) => (state.get().voice === 'mimo' ? mimoGate.allow(gesture, at) : true),
           play: (hz, meta) => {
             lastTick = meta !== null && meta !== undefined && meta.tick !== null ? meta.tick : null;
             let played = false;
             try {
-              played = engine.play(hz);
+              played = engine.play(hz, meta);
             } catch (error) {
               played = false;
             }
@@ -1557,10 +1871,14 @@ window.__ModuleLoader__.load({
           runtime.listeners = attachRailListeners({
             view,
             arm: () => engine.arm(),
+            gate: mimoGate,
+            // 去重粒度与控制器一致（mimo = 刻度下标）；监听层若不注入，会在
+            // 控制器之前按 10 档音级把相邻刻度拦掉，mimo 音色就听不出音阶。
+            keyFor: (degree, tick) => dedupKeyFor(state.get().voice, degree, tick),
             // 必须把控制器的返回值交回去：emit 靠它更新监听层的音级锚点，
             // 吞掉返回值会让「同音级不重响」的闸门形同虚设（v0.1.10 在真实会话中复现过）。
-            signal: (position, source, tick, options) =>
-              controller.signal(position, source, tick, options),
+            signal: (position, source, tick, options, gesture) =>
+              controller.signal(position, source, tick, options, gesture),
           });
           try {
             view.__dshRailTonesActive = record;
@@ -1819,8 +2137,26 @@ window.__ModuleLoader__.load({
         CHIME_ATTACK_S,
         CHIME_DECAY_S,
         CHIME_PEAK_SCALE,
+        MIMO_NOTES,
+        MIMO_STEPS,
+        MIMO_ATTACK_S,
+        MIMO_DECAY_S,
+        MIMO_HIT_DECAY_S,
+        MIMO_STOP_PAD_S,
+        MIMO_HOVER_GAIN,
+        MIMO_HIT_GAIN,
+        MIMO_GATE_ENTRY_MS,
+        MIMO_GATE_WINDOW_MS,
+        MIMO_GATE_MAX_SPEED,
         ATTACK_S,
         normalizeVoice,
+        synthForVoice,
+        pitchForVoice,
+        resolvePitch,
+        dedupKeyFor,
+        mimoFrequencyAt,
+        mimoHzFor,
+        createMimoGate,
         STORE_KEY,
         degreeForPosition,
         noteHz,

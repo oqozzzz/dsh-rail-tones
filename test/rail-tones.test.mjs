@@ -470,8 +470,8 @@ test('音色切换：默认正弦、白名单钳制、存量兼容与持久化',
 
   // 注册表：每项有 id/labelKey/descKey，id 唯一，默认 = 第一项；VOICES 由注册表派生。
   const ids = VOICE_OPTIONS.map((option) => option.id);
-  assert.ok(Array.isArray(VOICE_OPTIONS) && VOICE_OPTIONS.length >= 3, '注册表至少含 sine 与 piano、chime');
-  assert.deepEqual(ids, ['sine', 'piano', 'chime'], '注册表顺序即设置列表顺序');
+  assert.ok(Array.isArray(VOICE_OPTIONS) && VOICE_OPTIONS.length >= 4, '注册表至少含 sine / piano / chime / mimo');
+  assert.deepEqual(ids, ['sine', 'piano', 'chime', 'mimo'], '注册表顺序即设置列表顺序');
   assert.equal(new Set(ids).size, ids.length, '注册表 id 不得重复');
   for (const option of VOICE_OPTIONS) {
     assert.equal(typeof option.id, 'string');
@@ -691,6 +691,510 @@ test('音频引擎：未知音色 id 兜底默认合成器，绝不抛错', asyn
   assert.equal(DEFAULTS.voice, 'sine');
 });
 
+/** mimo 复刻音色的用例群：音高映射、滑动速度门槛、包络、以及接线。 */
+
+test('mimo 音高映射：逐字移植原文 s(d,m) —— 刻度下标 / 刻度总数', async () => {
+  const { mimoFrequencyAt, MIMO_NOTES, MIMO_STEPS } = (await loaded).internals;
+  assert.deepEqual([...MIMO_NOTES], [261.63, 293.66, 329.63, 392, 440], 'C4 D4 E4 G4 A4');
+  assert.equal(MIMO_STEPS, 18, 'r.length × 3.6 = 18');
+
+  // 原文：C = round(d / max(1, m-1) × 18)，d = 刻度下标、m = 刻度总数。
+  // 5 个刻度时逐档摊开整个 18 档阶梯（这是「移植」与 v0.2.4「复刻」的关键差别：
+  // v0.2.4 误把 0…1 的位置当刻度下标、又把本项目音级数 10 当总数，
+  // 结果整条音阶被压进最低 3 个半音，0.5 处只有 146.83Hz）。
+  assert.ok(Math.abs(mimoFrequencyAt(0, 5) - 130.815) < 0.01, '刻度 0/4 = C3');
+  assert.ok(Math.abs(mimoFrequencyAt(1, 5) - 261.63) < 0.01, '刻度 1/4 = C4');
+  assert.ok(Math.abs(mimoFrequencyAt(2, 5) - 440) < 0.01, '刻度 2/4 = A4');
+  assert.ok(Math.abs(mimoFrequencyAt(3, 5) - 880) < 0.01, '刻度 3/4 = A5');
+  assert.ok(Math.abs(mimoFrequencyAt(4, 5) - 1568) < 0.01, '刻度 4/4 = G6');
+  // 18 个刻度：round(17/17×18)=18 → 顶档 G6（1568Hz）。
+  assert.ok(Math.abs(mimoFrequencyAt(17, 18) - 1568) < 0.01, '18 刻度时顶档 = step 18 = G6');
+  assert.ok(Math.abs(mimoFrequencyAt(8, 18) - 392) < 0.01, '18 刻度中点 = step 8 = G4');
+
+  // 单调不减：整条导轨逐刻度扫过不会出现音高回落。
+  let previous = 0;
+  for (let step = 0; step <= 40; step += 1) {
+    const hz = mimoFrequencyAt(step, 41);
+    assert.ok(hz >= previous, `刻度 ${step}/40 处音高回落`);
+    previous = hz;
+  }
+  // 非法输入。
+  assert.equal(mimoFrequencyAt(Number.NaN, 18), null);
+  assert.equal(mimoFrequencyAt(undefined, 18), null);
+  assert.equal(mimoFrequencyAt(0, Number.NaN), null);
+  assert.equal(mimoFrequencyAt(0, null), null);
+  assert.equal(mimoFrequencyAt(0, 0), null);
+  // 单刻度（m=1）：原文 Math.max(1, m-1) → 恒为最低档。
+  assert.equal(mimoFrequencyAt(0, 1), mimoFrequencyAt(0, 5), '单刻度 = 最低档（原文 max(1,m-1)）');
+});
+
+test('mimo 音高兜底：有刻度用刻度，没刻度退化为「铺满导轨」的等价形态', async () => {
+  const { mimoHzFor, mimoFrequencyAt, MIMO_STEPS } = (await loaded).internals;
+  // 有刻度信息 → 走原文语义（刻度下标 / 刻度总数）。
+  assert.equal(mimoHzFor({ tick: 2, tickCount: 5, position: 0.9 }), mimoFrequencyAt(2, 5), '刻度优先于位置');
+  assert.equal(mimoHzFor({ tick: 0, tickCount: 5 }), mimoFrequencyAt(0, 5));
+  // 没有刻度（试听 / 宿主不提供 data-index）→ position 当作铺满的刻度比例。
+  assert.equal(mimoHzFor({ position: 0 }), mimoFrequencyAt(0, MIMO_STEPS), '位置 0 = 最低档');
+  assert.equal(mimoHzFor({ position: 1 }), mimoFrequencyAt(MIMO_STEPS - 1, MIMO_STEPS), '位置 1 = 最高档');
+  assert.equal(mimoHzFor({ position: 0.5 }), mimoFrequencyAt(Math.round(0.5 * (MIMO_STEPS - 1)), MIMO_STEPS));
+  // 非法输入。
+  assert.equal(mimoHzFor(null), null);
+  assert.equal(mimoHzFor({ position: Number.NaN }), null);
+});
+
+test('mimo 滑动速度门槛：逐字移植原文 Le/qe/Ve/fe（慢速放行、快速甩动静音）', async () => {
+  const { createMimoGate, MIMO_GATE_ENTRY_MS, MIMO_GATE_WINDOW_MS, MIMO_GATE_MAX_SPEED } = (await loaded).internals;
+  assert.equal(MIMO_GATE_ENTRY_MS, 100, '原文 ke');
+  assert.equal(MIMO_GATE_WINDOW_MS, 80, '原文 He');
+  assert.equal(MIMO_GATE_MAX_SPEED, 600, '原文 je');
+
+  // 慢速移动 → 放行（原文「速度 < 600px/s ⇒ true」）。
+  // 起手帧 t=0；t=140 时已过 100ms 观察窗，窗口内保留 t=60 与 t=140 两帧：
+  // 60ms 内移动 6px = 100px/s < 600 → 放行。
+  const gate = createMimoGate({});
+  assert.equal(gate.allow({ x: 0, y: 0 }, 0), false, '进入瞬间静音');
+  assert.equal(gate.allow({ x: 0, y: 50 }, 50), false, '仍在 100ms 内');
+  assert.equal(gate.allow({ x: 0, y: 56 }, 140), true, '慢速划过放行（100px/s）');
+  // 快速甩动 → 静音：60ms 内 60px = 1000px/s，且两帧都在 80ms 取样窗口内。
+  const fast = createMimoGate({});
+  fast.allow({ x: 0, y: 0 }, 0);
+  assert.equal(fast.allow({ x: 0, y: 50 }, 50), false, '仍在 100ms 内');
+  assert.equal(fast.allow({ x: 0, y: 110 }, 110), false, '60ms/60px = 1000px/s > 600 → 静音');
+  assert.equal(fast.allow({ x: 0, y: 170 }, 170), false, '持续快速划过 → 继续静音');
+  // 临界：恰好 600px/s 静音（原文严格小于），583px/s 放行。
+  // 两帧都落在 80ms 取样窗口内，且已过 100ms 观察窗（t=100 与 t=160，间隔 60ms）。
+  const boundary = (px) => {
+    const probe = createMimoGate({});
+    probe.allow({ x: 0, y: 0 }, 0); // 记 entryAt
+    probe.allow({ x: 0, y: 0 }, 100); // 窗口内首帧
+    return probe.allow({ x: 0, y: px }, 160); // 60ms 后
+  };
+  assert.equal(boundary(35), true, '583px/s → 放行');
+  assert.equal(boundary(36), false, '恰好 600px/s → 静音（严格 <）');
+  assert.equal(boundary(37), false, '617px/s → 静音');
+
+  // 持续慢速划动始终放行；持续快速划动：过了观察窗后立刻被拦。
+  const slow = createMimoGate({});
+  slow.allow({ x: 0, y: 0 }, 0);
+  assert.equal(slow.allow({ x: 0, y: 4 }, 100), true);
+  assert.equal(slow.allow({ x: 0, y: 8 }, 160), true);
+  const flick = createMimoGate({});
+  flick.allow({ x: 0, y: 0 }, 0);
+  assert.equal(flick.allow({ x: 0, y: 100 }, 100), true, '窗口内只有一帧 → 原文放行');
+  assert.equal(flick.allow({ x: 0, y: 200 }, 160), false, '两帧入窗后 → 1000px/s 静音');
+
+  // 单帧（样本 <2）放行 —— 原文 `samples.length < 2 ⇒ true`。
+  const single = createMimoGate({});
+  assert.equal(single.allow({ x: 0, y: 0 }, 0), false, '首帧仍受 entry 窗口约束');
+  assert.equal(single.allow({ x: 0, y: 0 }, 200), true, '窗口内只剩一帧 → 放行（原文语义）');
+
+  // reset()（离开导轨 / blur，原文 fe）后重新进入 100ms 观察窗。
+  const leaving = createMimoGate({});
+  leaving.allow({ x: 0, y: 0 }, 0);
+  assert.equal(leaving.allow({ x: 0, y: 3 }, 120), true, '复位前慢速放行');
+  leaving.reset();
+  assert.equal(leaving.allow({ x: 0, y: 6 }, 140), false, '复位后重新进入 100ms 观察窗');
+  assert.equal(leaving.stats().samples, 1, 'reset 清空采样');
+
+  // 手势缺失 / 非法坐标一律放行（点击、滚轮、试听不走这条路）。
+  assert.equal(gate.allow(null, 0), true);
+  assert.equal(gate.allow(undefined, 0), true);
+  assert.equal(createMimoGate({}).allow({ x: Number.NaN, y: 0 }, 0), true);
+});
+
+test('音频引擎：mimo 音色 = 三角波 + 原文双档包络与绝对增益', async () => {
+  const { createEngine, VOICES, MIMO_HOVER_GAIN, MIMO_HIT_GAIN, MIMO_ATTACK_S, MIMO_DECAY_S, MIMO_HIT_DECAY_S, MIMO_STOP_PAD_S } =
+    (await loaded).internals;
+  assert.equal(MIMO_HOVER_GAIN, 0.13, '原文 hover 绝对增益');
+  assert.equal(MIMO_HIT_GAIN, 0.3, '原文 hit 绝对增益');
+
+  const build = (volume) => {
+    const { context, nodes } = fakeAudio();
+    const engine = createEngine({
+      AudioContext: function FakeAudioContext() { return context; },
+      volume: () => volume,
+      voice: () => VOICES.mimo,
+    });
+    return { engine, context, nodes };
+  };
+
+  // hover（划过，原文 `p(s(d,m), !1)`）：三角波、8ms 指数升到 0.13、0.42s 衰减、+0.05s 停振。
+  const hover = build(1);
+  assert.equal(hover.engine.play(261.63, { source: 'hover', strong: false }), true);
+  assert.equal(hover.nodes.oscillators.length, 1, 'mimo 音恰 1 个振荡器');
+  assert.equal(hover.nodes.oscillators[0].type, 'triangle', '必须是三角波（3 次谐波 ≈ −19dB 的亮泛音来源）');
+  assert.equal(hover.nodes.oscillators[0].hz, 261.63);
+  const hoverValues = hover.nodes.gains[0].gain.values;
+  assert.deepEqual(hoverValues, [0.0001, MIMO_HOVER_GAIN, 0.0001], '包络：1e-4 → 0.13 → 1e-4');
+  assert.equal(MIMO_ATTACK_S, 0.008, '原文 h+.008');
+  assert.equal(MIMO_DECAY_S, 0.42, '原文 hover 衰减');
+  assert.ok(
+    Math.abs(hover.nodes.oscillators[0].stopAt - (1.5 + MIMO_DECAY_S + MIMO_STOP_PAD_S)) < 1e-9,
+    '停振点 = 衰减 + 0.05s（原文 .46）',
+  );
+
+  // 强音档（点击刻度 / 键盘激活 / 试听，原文 `p(s(d,m), !0)`）：0.3 / 0.9s。
+  const click = build(1);
+  assert.equal(click.engine.play(261.63, { source: 'click', strong: true }), true);
+  const clickValues = click.nodes.gains[0].gain.values;
+  assert.deepEqual(clickValues, [0.0001, MIMO_HIT_GAIN, 0.0001], '点击 = 强音档 0.3');
+  assert.equal(MIMO_HIT_DECAY_S, 0.9, '原文 hit 衰减');
+  assert.ok(
+    Math.abs(click.nodes.oscillators[0].stopAt - (1.5 + MIMO_HIT_DECAY_S + MIMO_STOP_PAD_S)) < 1e-9,
+    '强音停振 = 0.95s',
+  );
+  // 强音必须比弱音响（原文两档差 ≈ 7.3dB）。
+  assert.ok(clickValues[1] > hoverValues[1], '点击强音应明显响于划过');
+
+  // 没有 strong 标记（如滚轮 / 拖拽）→ 弱音档。
+  const plain = build(1);
+  plain.engine.play(261.63, { source: 'wheel' });
+  assert.ok(Math.abs(plain.nodes.gains[0].gain.values[1] - MIMO_HOVER_GAIN) < 1e-12, '滚轮走弱音档');
+
+  // 音量线性缩放（100% = 与 mimo 等响）；音量 0 静音；两档都在满幅内。
+  const half = build(0.5);
+  half.engine.play(261.63, { source: 'hover', strong: false });
+  assert.ok(Math.abs(half.nodes.gains[0].gain.values[1] - MIMO_HOVER_GAIN * 0.5) < 1e-12, '峰值随音量线性缩放');
+  assert.ok(MIMO_HIT_GAIN < 1 && MIMO_HOVER_GAIN < 1, '两档满音量都在满幅之内');
+  const zero = build(0);
+  assert.equal(zero.engine.play(261.63, { source: 'hover' }), false);
+  assert.equal(zero.nodes.oscillators.length, 0, '音量为 0 不建节点');
+});
+
+test('音频引擎：存量音色忽略第 4 参 meta（向后兼容）', async () => {
+  const { createEngine, VOICES, PEAK_FACTOR } = (await loaded).internals;
+  const { context, nodes } = fakeAudio();
+  const engine = createEngine({
+    AudioContext: function Fake() { return context; },
+    volume: () => 1,
+    voice: () => VOICES.sine,
+  });
+  // v0.2.4 起引擎会把 meta 作为第 4 参传给合成器：既有合成器必须完全无视它。
+  assert.equal(engine.play(440, { source: 'click', degree: 3, tick: 7 }), true);
+  assert.equal(nodes.oscillators.length, 1);
+  assert.equal(nodes.oscillators[0].type, 'sine');
+  assert.equal(nodes.oscillators[0].hz, 440);
+  assert.ok(Math.abs(nodes.gains[0].gain.values[1] - PEAK_FACTOR) < 1e-12, '包络不受 meta 影响');
+});
+
+test('调度器：音色自带的音高映射优先（context 形式），缺省回退 noteHz', async () => {
+  const { createController, mimoHzFor, noteHz } = (await loaded).internals;
+  const played = [];
+  let clock = 0;
+  let pitch = null;
+  const controller = createController({
+    play: (hz) => played.push(hz),
+    now: () => clock,
+    isEnabled: () => true,
+    pitchAt: (context) => (pitch === null ? null : pitch(context)),
+  });
+
+  // 没有自带映射（如 sine）→ 沿用全局的位置→音级→频率。
+  assert.equal(controller.signal(0.5, 'hover'), true);
+  assert.equal(played[0], noteHz(5), '缺省映射 = noteHz');
+  // 挂上 mimo 的映射 → 按刻度下标/总数算音高。
+  pitch = mimoHzFor;
+  clock = 500;
+  assert.equal(controller.signal(0.5, 'click', 2, { repeat: true }, { hover: false, tick: 2, tickCount: 5 }), true);
+  assert.equal(played[1], mimoHzFor({ tick: 2, tickCount: 5 }), '自带映射优先');
+  assert.ok(Math.abs(played[1] - 440) < 0.01, '刻度 2/5 = A4');
+  // 没有刻度信息时用位置兜底。
+  clock = 1000;
+  assert.equal(controller.signal(1, 'click', null, { repeat: true }, { hover: false }), true);
+  assert.equal(played[2], mimoHzFor({ position: 1 }), '无刻度 → 位置兜底');
+  // 映射抛错也要静默回退，不影响发声。
+  pitch = () => {
+    throw new Error('boom');
+  };
+  clock = 1500;
+  assert.equal(controller.signal(1, 'click', null, { repeat: true }, { hover: false }), true);
+  assert.equal(played[3], noteHz(9), '映射抛错回退 noteHz');
+});
+
+test('调度器：去重键可注入 —— mimo 按刻度下标，其它音色按音级', async () => {
+  const { createController, dedupKeyFor } = (await loaded).internals;
+  assert.equal(dedupKeyFor('mimo', 3, 7), 7, 'mimo 用刻度下标');
+  assert.equal(dedupKeyFor('mimo', 3, null), 3, '没有刻度时退回音级');
+  assert.equal(dedupKeyFor('sine', 3, 7), 3, '其它音色用音级');
+  assert.equal(dedupKeyFor('piano', 9, 2), 9);
+
+  const played = [];
+  let clock = 0;
+  let voice = 'mimo';
+  const controller = createController({
+    play: (hz, meta) => played.push({ hz, ...meta }),
+    now: () => clock,
+    isEnabled: () => true,
+    keyFor: (degree, tick) => dedupKeyFor(voice, degree, tick),
+  });
+  // 同一刻度（key=5）在 250ms 窗口内不重响。
+  assert.equal(controller.signal(0.5, 'hover', 5), true);
+  clock = 100;
+  assert.equal(controller.signal(0.5, 'hover', 5), false, '同刻度窗口内不响');
+  // 相邻刻度（key=6）即便落在同一 10 档音级里，也应各自发声 —— 这是 mimo 的粒度。
+  clock = 120;
+  assert.equal(controller.signal(0.52, 'hover', 6), true, '相邻刻度应各自发声（mimo 粒度）');
+  assert.equal(played.length, 2);
+  // 其它音色：换回音级粒度 —— 相邻刻度若同音级则不响。
+  voice = 'sine';
+  clock = 400;
+  assert.equal(controller.signal(0.5, 'hover', 5), true, '切回音级粒度后可响');
+  clock = 500;
+  const sameDegreeTicks = [7, 8].filter((t) => dedupKeyFor('sine', 5, t) === 5);
+  assert.ok(sameDegreeTicks.length === 2, '前提：这两个刻度在 sine 下同音级');
+  assert.equal(controller.signal(0.5, 'hover', 7), false, 'sine：同音级不响');
+  assert.equal(controller.signal(0.5, 'hover', 8), false, 'sine：同音级仍不响');
+});
+
+test('调度器：meta.strong 只在明确手势（repeat）时为真', async () => {
+  const { createController } = (await loaded).internals;
+  const played = [];
+  let clock = 0;
+  const controller = createController({
+    play: (hz, meta) => played.push(meta),
+    now: () => clock,
+    isEnabled: () => true,
+  });
+  // 划过 / 滚轮 → 弱音档。
+  assert.equal(controller.signal(0.2, 'hover'), true);
+  assert.equal(played[0].strong, false, '划过 = 弱音档');
+  clock = 500;
+  assert.equal(controller.signal(0.5, 'wheel'), true);
+  assert.equal(played[1].strong, false, '滚轮 = 弱音档');
+  // 点击 / 键盘激活 / 试听（repeat）→ 强音档（原文 hit 路径）。
+  clock = 1000;
+  assert.equal(controller.signal(0.8, 'slide', 9, { repeat: true }), true);
+  assert.equal(played[2].strong, true, '按下 = 强音档');
+  assert.equal(played[2].tick, 9);
+  clock = 1500;
+  assert.equal(controller.signal(0.8, 'preview', null, { repeat: true }), true);
+  assert.equal(played[3].strong, true, '试听 = 强音档');
+});
+
+test('接线：apply 的 pitchAt 按当前音色挑映射（sine 走 noteHz、mimo 走刻度映射）', async () => {
+  const { pitchForVoice, resolvePitch, mimoHzFor, noteHz, createController } = (await loaded).internals;
+
+  // 注册表里只有 mimo 自带映射；其它音色必须返回 null（→ 回退 noteHz）。
+  assert.equal(pitchForVoice('mimo'), mimoHzFor);
+  assert.equal(pitchForVoice('sine'), null);
+  assert.equal(pitchForVoice('piano'), null);
+  assert.equal(pitchForVoice('chime'), null);
+  assert.equal(pitchForVoice('no-such-voice'), null);
+  assert.equal(resolvePitch(null, { degree: 5, position: 0.5 }), null, '没有自带映射 → null（回退 noteHz）');
+
+  // 逐字复用 apply 里那一行装配：`resolvePitch(pitchForVoice(state.get().voice), context)`。
+  // 回归：这条断言盯的是「音色 → 映射」的选择真的接上了 —— 若把 apply 里那行写成
+  // `() => null`（或漏调 pitchForVoice），切到 mimo 后音高仍会是 noteHz，此处立即失败。
+  let voice = 'sine';
+  let clock = 0;
+  const played = [];
+  const controller = createController({
+    pitchAt: (context) => resolvePitch(pitchForVoice(voice), context),
+    play: (hz, meta) => played.push({ hz, ...meta }),
+    now: () => clock,
+    isEnabled: () => true,
+  });
+
+  // sine：位置 0.5 → 本项目的 A 大调五声（noteHz(5) = 440）。
+  controller.signal(0.5, 'click', 5, { repeat: true });
+  assert.equal(played[0].hz, noteHz(5), '默认音色 = 全局 noteHz');
+  assert.equal(played[0].hz, 440);
+
+  // mimo：同一个刻度（下标 2 / 总数 5）→ 刻度映射给出 A4（440Hz）。
+  // 换到刻度 3 以避开 250ms 同键窗口（mimo 按刻度去重）。
+  voice = 'mimo';
+  clock = 500;
+  controller.signal(0.5, 'click', 3, { repeat: true }, { hover: false, tick: 3, tickCount: 5 });
+  assert.equal(played[1].hz, mimoHzFor({ tick: 3, tickCount: 5 }), 'mimo 音色必须走刻度映射');
+  assert.ok(Math.abs(played[1].hz - 880) < 0.01, '刻度 3/5 = A5');
+  assert.notEqual(played[1].hz, noteHz(5), '同一位置两套映射给出不同的音');
+});
+
+test('接线：走真实 apply，音色切换后 debug().play() 用该音色的映射发声', async (t) => {
+  // 上面的用例直接调 resolvePitch；这一条走**完整 apply**，盯的是「apply 里真的调了
+  // pitchForVoice(state.get().voice)」——把 apply 里那行写成 `() => null` 时，
+  // 上面那条仍会通过，只有这条会失败。
+  const boot = await bootPlugin();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+  const { noteHz, mimoHzFor } = (await loaded).internals;
+
+  // 默认 sine：0.5 处 = A 大调五声第 5 档 = 440Hz。
+  boot.debug().play(0.5);
+  let log = boot.debug().log(1)[0];
+  assert.equal(log.hz, noteHz(5), '默认音色走 noteHz');
+  assert.equal(log.hz, 440);
+
+  // 切到 mimo：debug().play() 不带刻度 → 走位置兜底（铺满 18 档的等价形态）。
+  boot.debug().setVoice('mimo');
+  assert.equal(boot.debug().status().voice, 'mimo');
+  t.mock.timers.tick(300); // 越过 70ms 最小间隔
+  boot.debug().play(0.5);
+  log = boot.debug().log(1)[0];
+  assert.equal(
+    log.hz,
+    mimoHzFor({ position: 0.5 }),
+    'mimo 音色必须走自带映射（apply 真的接了 pitchForVoice）',
+  );
+  assert.notEqual(log.hz, noteHz(5), '同一位置两套映射给出不同的音');
+
+  boot.shutdown();
+});
+
+test('调度器：滑动速度门槛只作用于「划过」（gesture.hover）', async () => {
+  const { createController } = (await loaded).internals;
+  const played = [];
+  let clock = 0;
+  const asked = [];
+  const controller = createController({
+    play: (hz) => played.push(hz),
+    now: () => clock,
+    isEnabled: () => true,
+    gate: (gesture, at) => {
+      asked.push({ gesture, at });
+      return gesture.y > 100; // 模拟速度门槛：只有「够慢/够靠下」才放行
+    },
+  });
+
+  // 划过带 hover 标记 → 被门槛拦下时不发声、也不更新去重键。
+  assert.equal(controller.signal(0.2, 'hover', 1, undefined, { hover: true, x: 0, y: 10 }), false);
+  assert.equal(played.length, 0);
+  assert.equal(asked.length, 1, '划过才问门槛');
+  // 放行后正常发声。
+  assert.equal(controller.signal(0.2, 'hover', 1, undefined, { hover: true, x: 0, y: 300 }), true);
+  assert.equal(played.length, 1);
+  assert.equal(asked.length, 2, '第二次划过又问了一次');
+  // 点击 / 滚轮 / 试听：上下文里 hover=false（或没有上下文）→ 一律不判门槛。
+  const askedAfterHover = asked.length;
+  clock = 500;
+  assert.equal(controller.signal(0.2, 'click', 1, { repeat: true }, { hover: false }), true, '点击不走速度门槛');
+  clock = 1000;
+  assert.equal(controller.signal(0.2, 'wheel', 1, undefined, { hover: false }), true, '滚轮不走速度门槛');
+  clock = 1500;
+  assert.equal(controller.signal(0.2, 'preview', null, { repeat: true }), true, '试听没有上下文也不判');
+  assert.equal(asked.length, askedAfterHover, '点击 / 滚轮 / 试听都没问门槛');
+});
+
+test('接线：监听层把刻度下标/总数与坐标交给调度器，离开导轨时复位门槛', async () => {
+  const rail = makeRail();
+  const { attachRailListeners, dedupKeyFor } = (await moduleWith(reactRequire)).__internals;
+  const calls = [];
+  let resets = 0;
+  let voice = 'mimo';
+  const listeners = attachRailListeners({
+    view: rail.view,
+    arm() {},
+    gate: {
+      reset() {
+        resets += 1;
+      },
+    },
+    keyFor: (degree, tick) => dedupKeyFor(voice, degree, tick),
+    signal: (position, source, tick, options, gesture) => {
+      calls.push({ position, source, tick, options, gesture });
+      return true;
+    },
+  });
+
+  // 划过：带坐标 + 刻度下标 + 刻度总数（mimo 的音高与门槛都要用）。
+  rail.dispatch('pointermove', { target: rail.ticks[2], clientY: 25, clientX: 7 });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].source, 'hover');
+  assert.equal(calls[0].gesture.hover, true, '划过必须带 hover 标记（门槛只作用于它）');
+  assert.deepEqual([calls[0].gesture.x, calls[0].gesture.y], [7, 25], '划过带坐标');
+  assert.equal(calls[0].tick, 2, '带刻度下标');
+  assert.equal(calls[0].gesture.tickCount, rail.ticks.length, '带刻度总数（5）');
+  assert.equal(calls[0].gesture.tick, 2);
+
+  // 按下：明确手势（repeat），带刻度信息但 hover=false（不判速度门槛）。
+  rail.dispatch('pointerdown', { target: rail.ticks[2], clientY: 25, clientX: 7 });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].source, 'slide');
+  assert.deepEqual(calls[1].options, { repeat: true });
+  assert.equal(calls[1].gesture.hover, false, '按下不受滑动速度门槛约束');
+  assert.equal(calls[1].gesture.tickCount, rail.ticks.length, '按下也要刻度总数（算音高）');
+
+  // mimo 粒度：相邻刻度（2 → 3）即便同属一个 10 档音级，也必须各自发声。
+  rail.dispatch('pointermove', { target: rail.ticks[3], clientY: 35, clientX: 7 });
+  assert.equal(calls.length, 3, 'mimo 音色下相邻刻度应各自发声');
+  assert.equal(calls[2].tick, 3);
+  // 切到按音级去重的音色后，**同一刻度重复划过**不发声（第二次被闸门跳过）。
+  voice = 'sine';
+  rail.dispatch('pointermove', { target: rail.ticks[3], clientY: 35, clientX: 7 });
+  const afterSwitch = calls.length;
+  rail.dispatch('pointermove', { target: rail.ticks[3], clientY: 35, clientX: 7 });
+  assert.equal(calls.length, afterSwitch, 'sine：同刻度重复划过不发声');
+  const dedup = listeners.stats();
+  assert.ok(dedup.skippedByDegree >= 1, '同键被闸门跳过');
+
+  // 「离开导轨」延迟确认到点 → 门槛采样复位（真离开再划回来算一段新手势）。
+  // 注意：离开的判定走 pointerout 的 relatedTarget 分支，必须带上导轨外的 relatedTarget。
+  const before = resets;
+  rail.dispatch('pointerout', { target: rail.ticks[2], relatedTarget: rail.outside });
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.ok(resets > before, '离开导轨后应复位门槛采样');
+  listeners.dispose();
+});
+
+test('接线：走真实 apply，mimo 音色下滑过相邻刻度会各自发声（监听层也用了 keyFor）', async (t) => {
+  // 回归：v0.2.4 的监听层闸门按 10 档音级去重，而 mimo 应按刻度下标 ——
+  // 只给控制器注入 keyFor 而漏掉监听层时，相邻刻度会在控制器之前就被拦掉。
+  // 这条用例走完整 apply，盯的正是「监听层也注入了同一个 keyFor」。
+  //
+  // 关键：刻度 3 与刻度 4 在本项目的 10 档划分里**同属音级 2**（位置 0.175 / 0.225），
+  // 所以「mimo 下从刻度 3 滑到刻度 4 仍能发声」只有在监听层按刻度去重时才成立；
+  // 监听层若仍按音级去重，第二帧会被它直接拦掉（notesPlayed 停在 1）。
+  const boot = await bootPlugin();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+  boot.debug().setVoice('mimo');
+
+  // mimo 首帧被 100ms 观察窗拦下（原文 Ve 语义）。
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[3], clientY: 35, clientX: 7 });
+  assert.equal(boot.debug().status().notesPlayed, 0, 'mimo 首帧静音（100ms 观察窗）');
+
+  // 第二帧起手（刻度 3），此后它就是锚点。
+  t.mock.timers.tick(200);
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[3], clientY: 35, clientX: 7 });
+  assert.equal(boot.debug().status().notesPlayed, 1, '第二帧发声（刻度 3）');
+  assert.equal(boot.debug().log(1)[0].tick, 3);
+  const dedup = boot.debug().status().dedup;
+  assert.equal(dedup.accepted, 1, '锚点已写入');
+  assert.equal(dedup.skippedByDegree, 0);
+
+  // 滑到刻度 4（**同属 10 档音级 2**）：mimo 下必须再响一声。
+  t.mock.timers.tick(200);
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[4], clientY: 45, clientX: 7 });
+  assert.equal(boot.debug().status().notesPlayed, 2, 'mimo：同音级内的相邻刻度也要各自发声');
+  const logs = boot.debug().log(2);
+  assert.deepEqual(logs.map((l) => l.tick), [3, 4], '刻度 3、4 各响一声');
+  // 音高按刻度映射（刻度 4 / 总数 5 → 顶档 1568Hz）。
+  const { mimoFrequencyAt } = (await loaded).internals;
+  assert.equal(logs[1].hz, Math.round(mimoFrequencyAt(4, 5) * 100) / 100, '末声 = 刻度映射');
+  assert.equal(logs[1].hz, 1568, '刻度 4/5 = G6');
+  boot.shutdown();
+});
+
+test('接线：走真实 apply，划过 / 按下各自发声（明确手势给确认音）', async (t) => {
+  const boot = await bootPlugin();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+  boot.debug().setVoice('mimo');
+
+  // mimo 的划过第一帧被 100ms 观察窗拦下（原文语义），第二帧才发声。
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[1], clientY: 15, clientX: 7 });
+  assert.equal(boot.debug().status().notesPlayed, 0, 'mimo 首帧静音（100ms 观察窗）');
+  t.mock.timers.tick(200);
+  boot.rail.dispatch('pointermove', { target: boot.rail.ticks[2], clientY: 25, clientX: 7 });
+  assert.equal(boot.debug().status().notesPlayed, 1, '第二帧发声');
+  assert.equal(boot.debug().log(1)[0].source, 'hover');
+  assert.equal(boot.debug().log(1)[0].tick, 2);
+
+  // 按下 = 明确手势（repeat）→ 不经速度门槛，同一刻度也给确认音。
+  t.mock.timers.tick(200);
+  boot.rail.dispatch('pointerdown', { target: boot.rail.ticks[2], clientY: 25, clientX: 7 });
+  assert.equal(boot.debug().status().notesPlayed, 2, '按下给确认音（不走速度门槛）');
+  assert.equal(boot.debug().log(1)[0].source, 'slide');
+  boot.shutdown();
+});
+
 test('清单契约：package.json、patch 与客户端产物', async () => {
   const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   assert.equal(manifest.name, 'dsh-rail-tones');
@@ -728,21 +1232,19 @@ test('清单契约：package.json、patch 与客户端产物', async () => {
   assert.ok(version !== null, 'client.js 必须声明 VERSION');
   assert.equal(version[1], manifest.version);
 
-  // 派生断言：音效注册表每个 id 必须挂上对应合成器，否则 play() 会静默走兜底，
-  // 新音效「注册表加了、引擎忘了」这种漂移立即在此显形。
-  const { VOICE_OPTIONS, DEFAULTS } = (await loaded).internals;
-  const synthMatch = source.match(/const SYNTHESIZERS = \{([^}]*)\}/);
-  assert.ok(synthMatch !== null, 'client.js 必须声明 SYNTHESIZERS 注册表');
+  // 派生断言（运行时结构级，比正则匹配源码更强）：注册表每个条目必须挂着
+  // 可调用的合成器，查询器对未知 id 返回 null、对默认音色必须能查到 ——
+  // 新音效「注册表加了、合成器忘挂」这种漂移立即在此显形。
+  const { VOICE_OPTIONS, DEFAULTS, synthForVoice } = (await loaded).internals;
+  assert.equal(typeof synthForVoice, 'function', '必须导出 synthForVoice 查询器');
   for (const option of VOICE_OPTIONS) {
-    assert.ok(
-      new RegExp(`\\b${option.id}\\s*:`).test(synthMatch[1]),
-      `VOICE_OPTIONS 的 "${option.id}" 必须在 SYNTHESIZERS 有对应合成器`,
-    );
+    assert.equal(typeof option.synth, 'function', `注册表条目 "${option.id}" 必须持有合成器`);
+    assert.equal(synthForVoice(option.id), option.synth, `synthForVoice("${option.id}") 应命中该条目`);
   }
-  assert.ok(
-    new RegExp(`\\b${DEFAULTS.voice}\\s*:`).test(synthMatch[1]),
-    `默认音色 "${DEFAULTS.voice}" 必须在 SYNTHESIZERS 有对应合成器`,
-  );
+  assert.equal(synthForVoice('no-such-voice'), null, '未知 id 必须返回 null');
+  assert.equal(typeof synthForVoice(DEFAULTS.voice), 'function', '默认音色必须可查到合成器');
+  assert.equal(synthForVoice(null), null);
+  assert.equal(synthForVoice(undefined), null);
 });
 
 test('设置注册：locale 服务未就绪（undefined）不打断注册链', async () => {
